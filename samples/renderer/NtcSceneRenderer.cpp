@@ -70,6 +70,8 @@ struct
     bool enableGpuDeflate = false;
     bool enableDLSS = true;
     int adapterIndex = -1;
+    const char* screenshotFile = nullptr;
+    const char* startMode = nullptr;
 } g_options;
 
 bool ProcessCommandLine(int argc, const char** argv)
@@ -93,6 +95,8 @@ bool ProcessCommandLine(int argc, const char** argv)
         OPT_BOOLEAN(0, "dlss", &g_options.enableDLSS, "Enable DLSS (default on, use --no-dlss)"),
         OPT_INTEGER(0, "adapter", &g_options.adapterIndex, "Index of the graphics adapter to use (use ntc-cli.exe --dx12|vk --listAdapters to find out)"),
         OPT_STRING(0, "materialDir", &g_options.materialDir, "Subdirectory near the scene file where NTC materials are located"),
+        OPT_STRING(0, "screenshot", &g_options.screenshotFile, "Render frames without UI and save a screenshot to this file (for headless testing)"),
+        OPT_STRING(0, "startMode", &g_options.startMode, "Initial NTC mode: load, sample, or feedback (feedback requires --dx12)"),
         OPT_END()
     };
 
@@ -283,6 +287,7 @@ private:
     NtcMode m_ntcMode = NtcMode::InferenceOnSample;
     std::string m_screenshotFileName;
     bool m_screenshotWithUI = true;
+    int m_screenshotDelayFrames = 0;
     bool m_useDepthPrepass = true;
     bool m_enableStochasticFeedback = true;
     float m_feedbackThreshold = 0.005f;
@@ -561,7 +566,42 @@ public:
         depthParams.numConstantBufferVersions = 128;
         m_depthPass->Init(*m_shaderFactory, depthParams);
 
-        m_ntcMode = g_options.inferenceOnSample ? NtcMode::InferenceOnSample : NtcMode::InferenceOnLoad;
+        // Default NTC mode when not overridden on the command line.
+        NtcMode const defaultNtcMode = g_options.inferenceOnSample
+            ? NtcMode::InferenceOnSample : NtcMode::InferenceOnLoad;
+
+        // Allow selecting the initial NTC mode from the command line (useful for
+        // headless testing). Feedback requires DX12 and the feature to be enabled.
+        if (g_options.startMode)
+        {
+            std::string const mode = g_options.startMode;
+            if (mode == "load")
+                m_ntcMode = NtcMode::InferenceOnLoad;
+            else if (mode == "sample" && g_options.inferenceOnSample)
+                m_ntcMode = NtcMode::InferenceOnSample;
+            else if (mode == "feedback" && g_options.inferenceOnFeedback)
+                m_ntcMode = NtcMode::InferenceOnFeedback;
+            else
+            {
+                log::warning("Ignoring unsupported --startMode '%s' (feedback requires --dx12).", g_options.startMode);
+                m_ntcMode = defaultNtcMode;
+            }
+        }
+        else
+        {
+            m_ntcMode = defaultNtcMode;
+        }
+
+        // Headless verification hook: when --screenshot is given, capture the rendered
+        // frame (without the UI overlay) so the output can be inspected off-screen.
+        if (g_options.screenshotFile)
+        {
+            m_screenshotFileName = g_options.screenshotFile;
+            m_screenshotWithUI = false;
+            // Warm up before capturing so streamed tiles (feedback) and temporal
+            // effects have converged by the time we grab the frame.
+            m_screenshotDelayFrames = 96;
+        }
 
         void const* pFontData;
         size_t fontSize;
@@ -1066,12 +1106,20 @@ public:
         m_transcodingTimer.update();
         m_previousFrameValid = true;
 
-        if (!m_screenshotFileName.empty() && !m_screenshotWithUI)
+        // Count down the warmup delay before taking a headless screenshot.
+        bool takeScreenshot = !m_screenshotFileName.empty();
+        if (takeScreenshot && m_screenshotDelayFrames > 0)
+        {
+            --m_screenshotDelayFrames;
+            takeScreenshot = false;
+        }
+
+        if (takeScreenshot && !m_screenshotWithUI)
             SaveScreenshot();
 
         ImGui_Renderer::Render(framebuffer);
 
-        if (!m_screenshotFileName.empty() && m_screenshotWithUI)
+        if (takeScreenshot && m_screenshotWithUI)
             SaveScreenshot();
     }
 

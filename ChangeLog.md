@@ -1,5 +1,17 @@
 # RTX Neural Texture Compression SDK Change Log
 
+## 0.10.0 BETA
+
+### LibNTC
+
+- Added support for inference using DX12 LinAlg API.
+- Added support for inference with OptiX.
+
+### Command-Line Tool
+
+- Added a mode to decompress texture sets with OptiX for testing.
+
+
 ## 0.9.2 BETA
 
 ### LibNTC

@@ -1,4 +1,4 @@
-# RTX Neural Texture Compression (NTC) SDK v0.9.2 BETA
+# RTX Neural Texture Compression (NTC) SDK v0.10.0 BETA
 
 [Quick Start Guide](#quick-start-guide)
 
@@ -51,13 +51,25 @@ Decompressing texels with NTC requires reading the latent data corresponding to 
 In order to provide robust backwards compatibility, fallback implementations of the inference code using the `DP4a` instructions or regular integer math have also been provided. This will allow for the decompression code to be executed reliably on any platform that supports at least Direct3D 12 Shader Model 6; however, there will be substantial performance improvements on newer GPUs. See [System Requirements](#system-requirements) for more details.
 
 > ### WARNING: Pre-Release Feature Dependency for Direct3D 12
-> NTC texture decompression for DX12 applications, both on-load and on-sample, relies on a preview version of the [Microsoft DirectX 12 Agility SDK](https://devblogs.microsoft.com/directx/directx12agility/), specifically, `1.717.x-preview`. In order for the [Cooperative Vector](https://devblogs.microsoft.com/directx/cooperative-vector/) extensions to work, the application must enable the `D3D12ExperimentalShaderModels` and `D3D12CooperativeVectorExperiment` features, which require that Windows is configured to  be in the Developer Mode. 
+> NTC texture decompression for DX12 applications, both on-load and on-sample, relies on a preview version of the [Microsoft DirectX 12 Agility SDK](https://devblogs.microsoft.com/directx/directx12agility/), specifically, `1.721.0-preview`. In order for the [LinAlg](https://devblogs.microsoft.com/directx/d3d12-linalg-preview/) (formerly Cooperative Vector) extensions to work, the application must enable the `D3D12ExperimentalShaderModels` feature, which requires that Windows is configured to be in the Developer Mode. 
 >
-> A pre-release NVIDIA GPU driver version 590.26 or later is required for Shader Model 6.9 functionality.
+> A pre-release NVIDIA GPU driver version 615 or later is required for Shader Model 6.9 functionality.
 > 
 > All non-CoopVec versions of DX12 decompression, as well as all Vulkan versions including CoopVec, are OK to use for shipping.
 >
-> **The DX12 Cooperative Vector support is for testing purposes only. DO NOT SHIP ANY PRODUCTS USING IT.**
+> **The DX12 LinAlg support is for testing purposes only. DO NOT SHIP ANY PRODUCTS USING IT.**
+
+#### Choosing the inference interface
+
+The SDK exposes hardware-accelerated inference generically as "Cooperative Vector," but the concrete interface it compiles and runs depends on the graphics API selected at run time (`--dx12` or `--vk`):
+
+| Backend | Cooperative Vector interface |
+|---------|------------------------------|
+| Direct3D 12 (`--dx12`) | Microsoft [LinAlg](https://devblogs.microsoft.com/directx/d3d12-linalg-preview/) (Shader Model 6.10, Agility SDK preview) |
+| Vulkan (`--vk`) | [`VK_NV_cooperative_vector`](https://registry.khronos.org/vulkan/specs/latest/man/html/VK_NV_cooperative_vector.html) |
+| Either, with `--no-coopVec` | `DP4a` / integer-math fallback |
+
+On Direct3D 12 the Cooperative Vector shaders are compiled exclusively against the LinAlg (SM 6.10) interface; there is no separate legacy Cooperative Vector path for DX12. If the LinAlg preview is unavailable - for example, Windows is not in Developer Mode, or the driver is not a preview build - run with `--no-coopVec` to use the `DP4a` fallback, which works on any Shader Model 6 GPU. The older `VK_NV_cooperative_vector` interface remains available through the Vulkan backend (`--vk`).
 
 ## Quick Start Guide
 
@@ -85,10 +97,11 @@ To see how NTC works on a sample 3D scene follow the instructions in the [NTC Re
 
 Operating System:
 - Windows 10/11 x64
+- Windows 11 ARM64
 - Linux x64
 
 Graphics APIs:
-- DirectX 12 - with preview Agility SDK for Cooperative Vector support
+- DirectX 12 - with preview Agility SDK for LinAlg support
 - Vulkan 1.3
 
 GPU for NTC decompression on load and transcoding to BCn:
@@ -105,7 +118,7 @@ GPU for NTC compression:
 
 _[*] The oldest GPUs that the NTC SDK functionality has been validated on are NVIDIA GTX 1000 series, AMD Radeon RX 6000 series, Intel Arc A series._
 
-For Cooperative Vector support on NVIDIA GPUs, please use the NVIDIA Graphics Driver preview version 590.26 or newer for DX12, or at least version 570 for Vulkan. The preview drivers can be downloaded using the following links (require an NVIDIA Developer Program account):
+For Cooperative Vector support on NVIDIA GPUs, please use the NVIDIA Graphics Driver preview version 615 or newer for DX12, or at least version 570 for Vulkan. The preview drivers can be downloaded using the following links (require an NVIDIA Developer Program account):
 
 - GeForce GPUs: https://developer.nvidia.com/downloads/shadermodel6-9-preview-driver
 - Quadro GPUs: https://developer.nvidia.com/downloads/assets/secure/shadermodel6-9-preview-driver-quadro
@@ -116,12 +129,12 @@ For a list of software components needed to build the SDK, please refer to the [
 
 - GDeflate decompression with `VK_NV_memory_decompression` with the NVIDIA 590.26 Developer Preview driver crashes the GPU unless Nsight Aftermath is enabled.
 - Running NTC SDK apps in D3D12 mode on non-Developer Preview NVIDIA drivers may result in messages like `ERROR: D3D12CreateDevice failed, error code = 0x80070057`. To work around that, add `--no-coopVec`.
-- CoopVec FP8 inference produces incorrect results on Intel Arc B-series GPUs with the latest driver (101.8425). Driver version 101.6913 is known to work correctly.
+- DX12 LinAlg inference is incompatible with the current version of AMD developer preview drivers (26.10.07.02).
 - Inference on Feedback mode in the Rendering sample is broken on AMD GPUs.
 
 ## Build Guide
 
-NTC SDK supports Windows x64 and Linux x64 targets.
+NTC SDK supports Windows x64, Windows ARM64, and Linux x64 targets.
 
 ### Windows x64
 
@@ -130,8 +143,7 @@ Building the NTC SDK on Windows requires the following components:
 - Visual Studio 2022 (at least the build tools)
 - [Windows SDK](https://developer.microsoft.com/en-us/windows/downloads/windows-sdk) (tested with 10.0.26100.0)
 - [CMake](https://cmake.org/download) (tested with v3.31)
-- [CUDA SDK](https://developer.nvidia.com/cuda-downloads) (tested with v12.9)
-  * NOTE: CUDA 13 is incompatible with the 590.26 developer preview driver that is necessary to use DirectX 12 Cooperative Vectors. While the NTC SDK can be built with CUDA 13, the resulting binaries will not work on the 590.26 driver. Please use CUDA 12.9 instead.
+- [CUDA SDK](https://developer.nvidia.com/cuda-downloads) (tested with v13.3)
 
 Follow the usual way of building CMake projects on Windows:
 
@@ -155,6 +167,26 @@ Follow the usual way of building CMake projects on Windows:
   * Build.
 
 Visual Studio Code with CMake Tools extension and Ninja build system works fine, too.
+
+### Windows ARM64
+
+Windows ARM64 (for example, the NVIDIA RTX Spark) is supported as well. The requirements are the same as for Windows x64, with the following differences:
+
+- The Visual Studio 2022 installation must include the ARM64 C++ build tools.
+- A CUDA Toolkit build for Windows ARM64 is required. At the time of writing this is only available as a developer preview: download **CUDA 13.4 for Windows ARM64** from the [CUDA 13.4 download archive](https://developer.nvidia.com/cuda-13-4-0-download-archive?target_os=Windows&target_arch=arm64&target_version=11&target_type=exe_local). It also requires an NVIDIA **R616 or newer** driver.
+- Both the Visual Studio generator and Ninja are supported. To generate and build a Visual Studio solution (`build/ntc.sln`), from a regular command prompt:
+  ```sh
+  cd RTXNTC
+  cmake -S . -B build -G "Visual Studio 17 2022" -A ARM64
+  cmake --build build --config Release
+  ```
+  Ninja works as well, for example from the "ARM64 Native Tools Command Prompt for VS 2022":
+  ```sh
+  cmake -S . -B build-ninja -G Ninja
+  cmake --build build-ninja
+  ```
+
+DirectX 12 (including Cooperative Vector), Vulkan, and CUDA-based compression all work on Windows ARM64. DLSS and OptiX have no Windows ARM64 support and are disabled automatically.
 
 ### Linux x64
 

@@ -11,82 +11,84 @@
  */
 
 #include <ntc-utils/Semantics.h>
-#include <algorithm>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <vector>
+
+namespace
+{
+char const kNtcSemMarker[] = "|ntcsem:";
+}
+
+std::string BuildTextureNameWithEmbeddedSemantics(std::string const& baseName,
+    std::vector<ImageSemanticBinding> const& semantics)
+{
+    if (semantics.empty())
+        return baseName;
+    std::string s = baseName;
+    s += kNtcSemMarker;
+    for (size_t i = 0; i < semantics.size(); ++i)
+    {
+        if (i > 0)
+            s += ',';
+        s += semantics[i].name;
+        s += ':';
+        s += std::to_string(semantics[i].firstChannel);
+        s += ':';
+        s += std::to_string(semantics[i].numChannels);
+    }
+    return s;
+}
+
+std::string StripNtcSemanticsSuffixForDisplay(std::string const& textureName)
+{
+    std::string::size_type const pos = textureName.find(kNtcSemMarker);
+    if (pos == std::string::npos)
+        return textureName;
+    return textureName.substr(0, pos);
+}
 
 void GuessImageSemantics(std::string const& distinctName, int channels, ntc::ChannelFormat channelFormat,
-    int imageIndex, bool &outIsSRGB, std::vector<SemanticBinding>& outSemantics)
+    int imageIndex, bool& outIsSRGB, std::vector<SemanticBinding>& outSemantics)
 {
-    std::string lowercaseName = distinctName;
-    std::transform(lowercaseName.begin(), lowercaseName.end(), lowercaseName.begin(), [](uint8_t ch) { return std::tolower(ch); });
+    (void)channels;
+    (void)channelFormat;
+    (void)outIsSRGB;
 
-    bool isSDR = channelFormat == ntc::ChannelFormat::UNORM8 || channelFormat == ntc::ChannelFormat::UNORM16;
-    outIsSRGB = isSDR;
+    std::string::size_type const markerPos = distinctName.find(kNtcSemMarker);
+    if (markerPos == std::string::npos)
+        return;
 
-    if ((lowercaseName.find("diffuse") != std::string::npos ||
-            lowercaseName.find("alb") != std::string::npos ||
-            lowercaseName.find("color") != std::string::npos) && channels >= 3)
+    std::string const tagRegion = distinctName.substr(markerPos + sizeof(kNtcSemMarker) - 1);
+    std::vector<SemanticBinding> parsed;
+    for (size_t at = 0; at < tagRegion.size();)
     {
-        outSemantics.push_back({ SemanticLabel::Albedo, imageIndex, 0 });
-        if (channels == 4 && isSDR) // Assume that HDR images do not have an alpha channel
-            outSemantics.push_back({ SemanticLabel::AlphaMask, imageIndex, 3 });
-    }
+        size_t const comma = tagRegion.find(',', at);
+        std::string const token = tagRegion.substr(at, comma == std::string::npos ? std::string::npos : comma - at);
+        at = comma == std::string::npos ? tagRegion.size() : comma + 1;
 
-    if ((lowercaseName.find("normal") != std::string::npos ||
-            lowercaseName.find("nrm") != std::string::npos) && channels >= 3)
-    {
-        outSemantics.push_back({ SemanticLabel::Normal, imageIndex, 0 });
-        outIsSRGB = false;
-    }
-    else if ((lowercaseName.find("orm") != std::string::npos ||
-                lowercaseName.find("arm") != std::string::npos) && channels >= 3) // "ORM" but not "nORMal"
-    {
-        outSemantics.push_back({ SemanticLabel::Occlusion, imageIndex, 0 });
-        outSemantics.push_back({ SemanticLabel::Roughness, imageIndex, 1 });
-        outSemantics.push_back({ SemanticLabel::Metalness, imageIndex, 2 });
-        outIsSRGB = false;
-    }
-    else if ((lowercaseName.find("rma") != std::string::npos) && channels >= 3)
-    {
-        outSemantics.push_back({ SemanticLabel::Roughness, imageIndex, 0 });
-        outSemantics.push_back({ SemanticLabel::Metalness, imageIndex, 1 });
-        outSemantics.push_back({ SemanticLabel::Occlusion, imageIndex, 2 });
-        outIsSRGB = false;
+        size_t const colon = token.find(':');
+        if (colon == std::string::npos)
+            continue;
+        size_t const colon2 = token.find(':', colon + 1);
+        std::string const lab = token.substr(0, colon);
+        int const fc = std::atoi(token.c_str() + colon + 1);
+        int nc = 4;
+        if (colon2 != std::string::npos)
+            nc = std::atoi(token.c_str() + colon2 + 1);
+        if (nc < 1)
+            nc = 1;
+        if (nc > 4)
+            nc = 4;
+        if (lab.empty())
+            continue;
+        parsed.push_back({ lab, imageIndex, fc, nc });
     }
 
-    if (lowercaseName.find("occlusion") != std::string::npos ||
-        lowercaseName.find("ambient") != std::string::npos ||
-        lowercaseName.find("ao") != std::string::npos)
-    {
-        outSemantics.push_back({ SemanticLabel::Occlusion, imageIndex, 0 });
-        outIsSRGB = false;
-    }
+    if (parsed.empty())
+        return;
 
-    if (lowercaseName.find("roughness") != std::string::npos)
-    {
-        outSemantics.push_back({ SemanticLabel::Roughness, imageIndex, 0 });
-        outIsSRGB = false;
-    }
-
-    if (lowercaseName.find("metal") != std::string::npos) // metalness or metallic
-    {
-        outSemantics.push_back({ SemanticLabel::Metalness, imageIndex, 0 });
-        outIsSRGB = false;
-    }
-
-    if (lowercaseName.find("mask") != std::string::npos)
-    {
-        outSemantics.push_back({ SemanticLabel::AlphaMask, imageIndex, 0 });
-    }
-
-    if (lowercaseName.find("emissive") != std::string::npos && channels >= 3)
-    {
-        outSemantics.push_back({ SemanticLabel::Emissive, imageIndex, 0 });
-    }
-
-    if (lowercaseName.find("disp") != std::string::npos)
-    {
-        outSemantics.push_back({ SemanticLabel::Displacement, imageIndex, 0 });
-        outIsSRGB = false;
-    }
+    outSemantics.insert(outSemantics.end(), parsed.begin(), parsed.end());
 }

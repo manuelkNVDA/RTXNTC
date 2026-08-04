@@ -14,10 +14,104 @@
 #include <filesystem>
 #include <json/json.h>
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iostream>
+#include <optional>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
 
 namespace fs = std::filesystem;
+
+namespace
+{
+
+/** When JSON omits "name", derive a stable id from the full relative fileName so different folders never
+ *  collide on the same stem (e.g. maps/a/normal.png vs maps/b/normal.png were both "normal" before). */
+std::string DefaultEntryNameFromRelativeFileName(std::string const& fileNameFromJson)
+{
+    fs::path const fp(fileNameFromJson);
+    std::vector<fs::path> comps;
+    for (fs::path const& p : fp)
+    {
+        if (p.empty() || p == "." || p == "..")
+            continue;
+        comps.push_back(p);
+    }
+    if (comps.empty())
+        return "texture";
+
+    std::string key;
+    for (size_t i = 0; i < comps.size(); ++i)
+    {
+        if (!key.empty())
+            key += '_';
+        if (i + 1 == comps.size())
+            key += comps[i].stem().generic_string();
+        else
+            key += comps[i].generic_string();
+    }
+    return key.empty() ? "texture" : key;
+}
+
+
+/** Only int / uint / double / decimal string count; bool/object/array/null (except missing) → 0 with optional warning.
+ *  JsonCpp asInt() maps true→1, false→0, so a mistaken mipLevel:true would skip mip-0 loading for that row. */
+int ParseManifestMipLevel(Json::Value const& node, char const* manifestFileNameForLog, std::string const& textureNameForLog)
+{
+    if (!node.isMember("mipLevel"))
+        return 0;
+    Json::Value const& m = node["mipLevel"];
+    if (m.isNull())
+        return 0;
+
+    int v = 0;
+    if (m.isInt() || m.isUInt())
+        v = m.asInt();
+    else if (m.isDouble())
+        v = static_cast<int>(m.asDouble());
+    else if (m.isString())
+    {
+        std::string const s = m.asString();
+        char* end = nullptr;
+        long const n = std::strtol(s.c_str(), &end, 10);
+        if (end == s.c_str() || *end != '\0')
+        {
+            if (manifestFileNameForLog)
+                std::fprintf(stderr,
+                    "Manifest '%s': texture '%s' has non-integer mipLevel string \"%s\"; using 0.\n",
+                    manifestFileNameForLog, textureNameForLog.c_str(), s.c_str());
+            return 0;
+        }
+        v = static_cast<int>(n);
+    }
+    else
+    {
+        if (manifestFileNameForLog)
+            std::fprintf(stderr,
+                "Manifest '%s': texture '%s' has invalid mipLevel (must be a number, not boolean/object); using 0.\n",
+                manifestFileNameForLog, textureNameForLog.c_str());
+        return 0;
+    }
+
+    if (v < 0 || v >= NTC_MAX_MIPS)
+    {
+        if (manifestFileNameForLog)
+            std::fprintf(stderr, "Manifest '%s': texture '%s' mipLevel %d out of range [0,%d); clamping.\n",
+                manifestFileNameForLog, textureNameForLog.c_str(), v, NTC_MAX_MIPS);
+        if (v < 0)
+            v = 0;
+        else
+            v = NTC_MAX_MIPS - 1;
+    }
+    return v;
+}
+
+} // namespace
 
 void LowercaseString(std::string& s)
 {
@@ -27,6 +121,14 @@ void LowercaseString(std::string& s)
 void UppercaseString(std::string& s)
 {
     std::transform(s.begin(), s.end(), s.begin(), [](uint8_t ch) { return std::toupper(ch); });
+}
+
+void ClampChannelSwizzleToSourceChannelCount(std::string& channelSwizzle, int sourceImageChannelCount)
+{
+    if (channelSwizzle.empty() || sourceImageChannelCount <= 0)
+        return;
+    if ((int)channelSwizzle.size() > sourceImageChannelCount)
+        channelSwizzle.resize(static_cast<size_t>(sourceImageChannelCount));
 }
 
 bool IsSupportedImageFileExtension(std::string const& extension)
@@ -92,6 +194,7 @@ void GenerateManifestFromDirectory(const char* path, bool loadMips, bool keepFil
 
         ManifestEntry& entry = outManifest.textures.emplace_back();
         entry.fileName = fileName.generic_string();
+        entry.manifestJsonFileName = entry.fileName;
         if (keepFileNames)
             entry.entryName = fileName.filename().generic_string();
         else
@@ -134,6 +237,7 @@ void GenerateManifestFromDirectory(const char* path, bool loadMips, bool keepFil
             
             ManifestEntry& entry = outManifest.textures.emplace_back();
             entry.fileName = fileName.generic_string();
+            entry.manifestJsonFileName = entry.fileName;
             entry.entryName = name.generic_string();
             entry.mipLevel = mipLevel;
         }
@@ -151,6 +255,7 @@ void GenerateManifestFromFileList(std::vector<const char *> const &files, bool k
 
         ManifestEntry& entry = outManifest.textures.emplace_back();
         entry.fileName = fileName.generic_string();
+        entry.manifestJsonFileName = entry.fileName;
         if (keepFileNames)
             entry.entryName = fileName.filename().generic_string();
         else
@@ -205,98 +310,335 @@ std::optional<ntc::BlockCompressedFormat> ParseBlockCompressedFormat(char const*
     return std::optional<ntc::BlockCompressedFormat>();
 }
 
-SemanticLabel ParseSemanticLabel(const char* label)
+bool ManifestSemanticNameEqualsInsensitive(std::string const& nameUtf8, char const* asciiLiteral)
 {
-    std::string uppercaseLabel = label;
-    UppercaseString(uppercaseLabel);
-
-    if (uppercaseLabel == "ALBEDO")
-        return SemanticLabel::Albedo;
-    if (uppercaseLabel == "ALPHA" || uppercaseLabel == "MASK" || uppercaseLabel == "ALPHAMASK")
-        return SemanticLabel::AlphaMask;
-    if (uppercaseLabel == "DISPL" || uppercaseLabel == "DISPLACEMENT")
-        return SemanticLabel::Displacement;
-    if (uppercaseLabel == "EMISSIVE" || uppercaseLabel == "EMISSION")
-        return SemanticLabel::Emissive;
-    if (uppercaseLabel == "METALNESS" || uppercaseLabel == "METALLIC")
-        return SemanticLabel::Metalness;
-    if (uppercaseLabel == "NORMAL")
-        return SemanticLabel::Normal;
-    if (uppercaseLabel == "OCCLUSION" || uppercaseLabel == "AO")
-        return SemanticLabel::Occlusion;
-    if (uppercaseLabel == "ROUGHNESS")
-        return SemanticLabel::Roughness;
-    if (uppercaseLabel == "TRANSMISSION")
-        return SemanticLabel::Transmission;
-    if (uppercaseLabel == "SPECULARCOLOR")
-        return SemanticLabel::SpecularColor;
-    if (uppercaseLabel == "GLOSSINESS")
-        return SemanticLabel::Glossiness;
-
-    return SemanticLabel::None;
+    if (!asciiLiteral)
+        return false;
+    std::string a = nameUtf8;
+    std::string b = asciiLiteral;
+    UppercaseString(a);
+    UppercaseString(b);
+    return a == b;
 }
 
-char const* SemanticLabelToString(SemanticLabel label)
+bool ManifestSemanticNameIsAlphaMask(std::string const& nameUtf8)
 {
-    switch (label)
+    std::string u = nameUtf8;
+    UppercaseString(u);
+    return u == "ALPHAMASK" || u == "ALPHA" || u == "MASK";
+}
+
+/** Defined below; semantics.json helpers in the anonymous namespace call this before its definition. */
+static void NormalizeSemanticsJsonRootKey(std::string& s);
+
+namespace
+{
+/**
+ * idTech / tool manifests often use \c "" as "use default layout for this slot". Matches common idTech
+ * material2 / manifest conventions (see also \c ClampChannelSwizzleToSourceChannelCount for BC5 vs RGB).
+ */
+std::string DefaultChannelsForEmptySemanticKey(std::string const& semanticName)
+{
+    std::string u = semanticName;
+    UppercaseString(u);
+
+    // Gradient helpers (_default placeholders): full RGBA swizzle in manifests.
+    if (u.find("GRADIENTMAP") != std::string::npos)
+        return "RGBA";
+
+    // BC1-style bloom / screen-space masks: treat as RGB when unspecified.
+    if (u == "BLOOMMASKMAP" || u == "BLOOMMASK"
+        || (u.find("BLOOM") != std::string::npos && u.find("MASK") != std::string::npos))
+        return "RGB";
+
+    // idTech BC1-style SSS / screen-space mask maps (same "" placeholder convention as bloom).
+    if (u == "SSSMASK" || u == "SSSMASKMAP"
+        || (u.find("SSS") != std::string::npos && u.find("MASK") != std::string::npos))
+        return "RGB";
+
+    if (u == "ALBEDO" || u == "BASECOLOR" || u == "DIFFUSE" || u == "COLOR" || u == "SPECULAR"
+        || u == "SPECULARCOLOR" || u == "EMISSIVE" || u == "EMISSION" || u == "METALNESS" || u == "METALLIC")
+        return "RGB";
+    if (u == "NORMAL" || u == "BUMP" || u == "TANGENT")
+        return "RGB";
+    if (u.size() >= 6 && u.compare(u.size() - 6, 6, "NORMAL") == 0)
+        return "RGB";
+
+    // Scalar height / displacement / roughness-style slots (BC4 / single channel in manifests).
+    if (u == "HEIGHTMAP" || u == "HEIGHT" || u == "DISPLACEMENT" || u == "ROUGHNESS" || u == "GLOSSINESS"
+        || u == "SMOOTHNESS" || u == "OCCLUSION" || u == "AO" || u == "AOMAP" || u == "COVER" || u == "CAVITY"
+        || u == "THICKNESS")
+        return "R";
+
+    return "R";
+}
+
+static std::unordered_map<std::string, Json::Value> BuildSemanticsLookupMap(Json::Value const& root)
+{
+    std::unordered_map<std::string, Json::Value> out;
+    if (!root.isObject())
+        return out;
+    for (std::string const& texName : root.getMemberNames())
     {
-        case SemanticLabel::None:
-            return "(None)";
-        case SemanticLabel::Albedo:
-            return "Albedo";
-        case SemanticLabel::AlphaMask:
-            return "AlphaMask";
-        case SemanticLabel::Displacement:
-            return "Displacement";
-        case SemanticLabel::Emissive:
-            return "Emissive";
-        case SemanticLabel::Glossiness:
-            return "Glossiness";
-        case SemanticLabel::Metalness:
-            return "Metalness";
-        case SemanticLabel::Normal:
-            return "Normal";
-        case SemanticLabel::Occlusion:
-            return "Occlusion";
-        case SemanticLabel::Roughness:
-            return "Roughness";
-        case SemanticLabel::SpecularColor:
-            return "SpecularColor";
-        case SemanticLabel::Transmission:
-            return "Transmission";
-        default:
-            static char string[16];
-            snprintf(string, sizeof(string), "%d", int(label));
-            return string;
+        Json::Value const& semObj = root[texName];
+        if (!semObj.isObject())
+            continue;
+        std::string key = texName;
+        NormalizeSemanticsJsonRootKey(key);
+        out.insert_or_assign(std::move(key), semObj);
     }
+    return out;
 }
 
-int GetSemanticChannelCount(SemanticLabel label)
+static Json::Value const* FindSemanticsJsonObjectForEntry(
+    std::unordered_map<std::string, Json::Value> const& byNorm, ManifestEntry const& e)
 {
-    switch (label)
+    auto const tryKey = [&](std::string key) -> Json::Value const* {
+        NormalizeSemanticsJsonRootKey(key);
+        auto it = byNorm.find(key);
+        if (it == byNorm.end())
+            return nullptr;
+        return &it->second;
+    };
+    if (Json::Value const* p = tryKey(e.entryName))
+        return p;
+    if (!e.manifestJsonFileName.empty())
     {
-        case SemanticLabel::Albedo:
-        case SemanticLabel::Emissive:
-        case SemanticLabel::Normal:
-        case SemanticLabel::SpecularColor:
-            return 3;
-
-        case SemanticLabel::AlphaMask:
-        case SemanticLabel::Displacement:
-        case SemanticLabel::Glossiness:
-        case SemanticLabel::Metalness:
-        case SemanticLabel::Occlusion:
-        case SemanticLabel::Roughness:
-        case SemanticLabel::Transmission:
-            return 1;
-
-        default:
-            return 0;
+        if (Json::Value const* p = tryKey(e.manifestJsonFileName))
+            return p;
+        if (Json::Value const* p = tryKey(DefaultEntryNameFromRelativeFileName(e.manifestJsonFileName)))
+            return p;
     }
+    if (Json::Value const* p = tryKey(DefaultEntryNameFromRelativeFileName(e.fileName)))
+        return p;
+    if (Json::Value const* p = tryKey(fs::path(e.fileName).stem().generic_string()))
+        return p;
+    if (Json::Value const* p = tryKey(fs::path(e.fileName).filename().generic_string()))
+        return p;
+    return nullptr;
 }
 
-static bool ParseManifest(char const* jsonData, size_t jsonSize, char const* manifestFileName, Manifest& outManifest, std::string& outError)
+static std::string ResolveChannelStringForManifestWrite(Json::Value const* semObj, ImageSemanticBinding const& binding)
 {
+    static char const* channelMap = "RGBA";
+    std::string fromBinding;
+    int const count = binding.numChannels;
+    if (binding.firstChannel >= 0 && count > 0 && binding.firstChannel + count <= 4)
+        fromBinding.assign(channelMap + binding.firstChannel, channelMap + binding.firstChannel + count);
+
+    if (!semObj || !semObj->isObject())
+    {
+        if (!fromBinding.empty())
+            return fromBinding;
+        return DefaultChannelsForEmptySemanticKey(binding.name);
+    }
+
+    for (std::string const& mem : semObj->getMemberNames())
+    {
+        if (mem == "isSRGB")
+            continue;
+        std::string ua = mem;
+        std::string ub = binding.name;
+        UppercaseString(ua);
+        UppercaseString(ub);
+        if (ua != ub)
+            continue;
+
+        Json::Value const& slotVal = (*semObj)[mem];
+        std::string channels;
+        if (slotVal.isString())
+            channels = slotVal.asString();
+        else if (slotVal.isNull())
+            channels.clear();
+        else if (slotVal.isNumeric() && slotVal.asDouble() == 0.0)
+            channels.clear();
+        else
+            continue;
+        UppercaseString(channels);
+        if (channels.empty())
+            channels = DefaultChannelsForEmptySemanticKey(mem);
+        return channels;
+    }
+
+    if (!fromBinding.empty())
+        return fromBinding;
+    return DefaultChannelsForEmptySemanticKey(binding.name);
+}
+
+static bool LoadSemanticsJsonFileIntoLookupMap(
+    char const* semanticsJsonPathUtf8, std::unordered_map<std::string, Json::Value>& outMap, std::string& outError)
+{
+    outMap.clear();
+    if (!semanticsJsonPathUtf8 || !semanticsJsonPathUtf8[0])
+    {
+        outError = "LoadSemanticsJsonFileIntoLookupMap: empty path.";
+        return false;
+    }
+
+    FILE* inputFile = fopen(semanticsJsonPathUtf8, "rb");
+    if (!inputFile)
+    {
+        std::ostringstream oss;
+        oss << "Cannot open semantics file '" << semanticsJsonPathUtf8 << "': " << strerror(errno);
+        outError = oss.str();
+        return false;
+    }
+
+    std::vector<char> fileContents;
+    bool success = ReadFileIntoVector(inputFile, fileContents);
+    fclose(inputFile);
+    if (!success)
+    {
+        std::ostringstream oss;
+        oss << "Error while reading semantics file '" << semanticsJsonPathUtf8 << "': " << strerror(errno);
+        outError = oss.str();
+        return false;
+    }
+
+    Json::CharReaderBuilder builder;
+    builder["collectComments"] = false;
+    Json::CharReader* reader = builder.newCharReader();
+    Json::Value root;
+    Json::String errorMessages;
+    if (!reader->parse(fileContents.data(), fileContents.data() + fileContents.size(), &root, &errorMessages))
+    {
+        std::ostringstream oss;
+        oss << "Cannot parse semantics file '" << semanticsJsonPathUtf8 << "': " << errorMessages;
+        outError = oss.str();
+        return false;
+    }
+
+    if (!root.isObject())
+    {
+        outError = "Malformed semantics file: root must be a JSON object mapping texture names to semantics objects.";
+        return false;
+    }
+
+    outMap = BuildSemanticsLookupMap(root);
+    return true;
+}
+} // namespace
+
+static bool ParseSemanticsJsonObjectIntoBindings(Json::Value const& semanticsNode, char const* textureNameForErrors,
+    std::vector<ImageSemanticBinding>& outSemantics, std::optional<bool>& outIsSRGBFromSemantics,
+    std::string& outError)
+{
+    if (!semanticsNode.isObject())
+    {
+        outError = "Semantics value must be a JSON object.";
+        return false;
+    }
+    outSemantics.clear();
+    outIsSRGBFromSemantics.reset();
+    for (std::string const& semanticName : semanticsNode.getMemberNames())
+    {
+        if (semanticName.empty())
+        {
+            outError = "Semantics object contains an empty semantic name key.";
+            return false;
+        }
+
+        if (semanticName == "isSRGB")
+        {
+            Json::Value const& v = semanticsNode[semanticName];
+            bool b = false;
+            if (v.isBool())
+                b = v.asBool();
+            else if (v.isInt() || v.isUInt())
+                b = (v.asInt() != 0);
+            else
+            {
+                std::ostringstream oss;
+                oss << "Invalid 'isSRGB' for texture '" << textureNameForErrors << "' (must be boolean or 0/1).";
+                outError = oss.str();
+                return false;
+            }
+            if (b)
+                outIsSRGBFromSemantics = true;
+            continue;
+        }
+
+        Json::Value const& slotVal = semanticsNode[semanticName];
+        std::string channels;
+        if (slotVal.isString())
+            channels = slotVal.asString();
+        else if (slotVal.isNull())
+            channels.clear();
+        else if (slotVal.isNumeric() && slotVal.asDouble() == 0.0)
+            channels.clear(); // some exporters use 0 instead of "" for "use default layout"
+        else
+        {
+            std::ostringstream oss;
+            oss << "Texture '" << textureNameForErrors << "': semantics slot '" << semanticName
+                << "' must be a string (R, RG, RGB, RGBA, or empty for defaults), null, or numeric 0.";
+            outError = oss.str();
+            return false;
+        }
+        UppercaseString(channels);
+        // idTech-style "" / null / 0 = default channel layout for this semantic slot name (not always scalar R).
+        if (channels.empty())
+            channels = DefaultChannelsForEmptySemanticKey(semanticName);
+        static char const* channelMap = "RGBA";
+        char const* firstChannelPtr = strstr(channelMap, channels.c_str());
+        if (!firstChannelPtr)
+        {
+            std::ostringstream oss;
+            oss << "Invalid semantic binding '" << channels << "' for texture '" << textureNameForErrors << "' semantic '"
+                << semanticName << "'. Semantic bindings must use sequential channels from RGBA set.";
+            outError = oss.str();
+            return false;
+        }
+
+        int const numCh = int(channels.size());
+        if (numCh < 1 || numCh > 4)
+        {
+            outError = "Semantic binding must use 1 to 4 channel letters (R, RG, RGB, or RGBA).";
+            return false;
+        }
+
+        ImageSemanticBinding binding;
+        binding.name = semanticName;
+        binding.firstChannel = int(firstChannelPtr - channelMap);
+        binding.numChannels = numCh;
+        outSemantics.push_back(binding);
+    }
+    return true;
+}
+
+static bool DeriveChannelSwizzleFromSemanticsIfEmpty(ManifestEntry& entry, std::string& outError)
+{
+    if (!entry.channelSwizzle.empty() || entry.semantics.empty())
+        return true;
+
+    static constexpr char kRGBA[] = "RGBA";
+    std::vector<size_t> ord(entry.semantics.size());
+    for (size_t i = 0; i < ord.size(); ++i)
+        ord[i] = i;
+    std::sort(ord.begin(), ord.end(), [&](size_t a, size_t b) {
+        return entry.semantics[a].firstChannel < entry.semantics[b].firstChannel;
+    });
+    std::string autoSwizzle;
+    for (size_t const bi : ord)
+    {
+        ImageSemanticBinding const& binding = entry.semantics[bi];
+        int const n = binding.numChannels;
+        if (n <= 0 || binding.firstChannel < 0 || binding.firstChannel + n > 4)
+        {
+            std::ostringstream oss;
+            oss << "Cannot derive channelSwizzle for texture '" << entry.entryName << "'.";
+            outError = oss.str();
+            return false;
+        }
+        autoSwizzle.append(kRGBA + binding.firstChannel, static_cast<size_t>(n));
+    }
+    entry.channelSwizzle = std::move(autoSwizzle);
+    return true;
+}
+
+static bool ParseManifest(char const* jsonData, size_t jsonSize, char const* manifestFileName, Manifest& outManifest,
+    std::string& outError, bool ignoreInlineSemantics)
+{
+    std::unordered_set<std::string> mip0EntryNames;
     Json::CharReaderBuilder builder;
     builder["collectComments"] = false;
     Json::CharReader* reader = builder.newCharReader();
@@ -346,16 +688,30 @@ static bool ParseManifest(char const* jsonData, size_t jsonSize, char const* man
         }
 
         std::string const fileName = node["fileName"].asString();
+        if (fileName.empty())
+        {
+            outError = "Malformed manifest: texture entry has empty or missing 'fileName'.";
+            return false;
+        }
 
         ManifestEntry entry;
+        entry.manifestJsonFileName = fileName;
         if (manifestFileName)
-            entry.fileName = (fs::path(manifestFileName).parent_path() / fileName).generic_string();
+        {
+            // Relative paths are resolved against the manifest file's directory. Absolute paths in JSON
+            // are used as explicit locations (no join), so tools can reference assets outside that tree.
+            fs::path const texturePath(fileName);
+            if (texturePath.is_absolute())
+                entry.fileName = texturePath.lexically_normal().generic_string();
+            else
+                entry.fileName = (fs::path(manifestFileName).parent_path() / texturePath).lexically_normal().generic_string();
+        }
         else
             entry.fileName = fileName;
         entry.entryName = node["name"].asString();
         if (entry.entryName.empty())
-            entry.entryName = fs::path(fileName).stem().generic_string();
-        entry.mipLevel = node["mipLevel"].asInt();
+            entry.entryName = DefaultEntryNameFromRelativeFileName(fileName);
+        entry.mipLevel = ParseManifestMipLevel(node, manifestFileName, entry.entryName);
         entry.isSRGB = node["isSRGB"].asBool();
         entry.verticalFlip = node["verticalFlip"].asBool();
         entry.channelSwizzle = node["channelSwizzle"].asString();
@@ -393,7 +749,7 @@ static bool ParseManifest(char const* jsonData, size_t jsonSize, char const* man
             bcFormat = node["outputFormat"].asString(); // Legacy version
         if (!bcFormat.empty())
         {
-            auto parsedFormat = ParseBlockCompressedFormat(bcFormat.c_str());
+            auto parsedFormat = ParseBlockCompressedFormat(bcFormat.c_str(), true);
             if (parsedFormat.has_value())
             {
                 entry.bcFormat = parsedFormat.value();
@@ -407,54 +763,27 @@ static bool ParseManifest(char const* jsonData, size_t jsonSize, char const* man
             }
         }
 
-        // Parse the semantic bindings
-        Json::Value const& semanticsNode = node["semantics"];
-        if (semanticsNode.isObject())
+        // Parse per-texture semantic bindings from manifest (skipped when ignoreInlineSemantics is set)
+        if (!ignoreInlineSemantics)
         {
-            for (std::string const& semanticName : semanticsNode.getMemberNames())
+            Json::Value const& semanticsNode = node["semantics"];
+            if (semanticsNode.isObject())
             {
-                SemanticLabel label = ParseSemanticLabel(semanticName.c_str());
-                if (label == SemanticLabel::None)
-                {
-                    std::ostringstream oss;
-                    oss << "Unknown semantic label '" << semanticName.c_str() << "' specified for texture '" << entry.entryName << "'.";
-                    outError = oss.str();
+                std::optional<bool> semanticsIsSRGB;
+                if (!ParseSemanticsJsonObjectIntoBindings(semanticsNode, entry.entryName.c_str(), entry.semantics,
+                        semanticsIsSRGB, outError))
                     return false;
-                }
-
-                std::string channels = semanticsNode[semanticName].asString();
-                UppercaseString(channels);
-                static char const* channelMap = "RGBA";
-                char const* firstChannelPtr = strstr(channelMap, channels.c_str());
-                if (channels.empty() || !firstChannelPtr)
-                {
-                    std::ostringstream oss;
-                    oss << "Invalid semantic binding '" << channels << "' specified for texture '" << entry.entryName
-                        << "' semantic '" << semanticName << "'. Semantic bindings must use sequential channels from RGBA set.";
-                    outError = oss.str();
-                    return false;
-                }
-
-                int expectedChannelCount = GetSemanticChannelCount(label);
-                if (int(channels.size()) != expectedChannelCount)
-                {
-                    std::ostringstream oss;
-                    oss << "Invalid semantic binding '" << channels << "' specified for texture '" << entry.entryName
-                        << "' semantic '" << semanticName << "'. This semantic requires " << expectedChannelCount << " channels.";
-                    outError = oss.str();
-                    return false;
-                }
-
-                ImageSemanticBinding binding;
-                binding.label = label;
-                binding.firstChannel = firstChannelPtr - channelMap;
-                entry.semantics.push_back(binding);
+                if (semanticsIsSRGB.has_value())
+                    entry.isSRGB = true;
             }
-        }
-        else if (!semanticsNode.isNull())
-        {
-            outError = "Malformed manifest: 'semantics' property must be an object.";
-            return false;
+            else if (!semanticsNode.isNull())
+            {
+                outError = "Malformed manifest: 'semantics' property must be an object.";
+                return false;
+            }
+
+            if (!DeriveChannelSwizzleFromSemanticsIfEmpty(entry, outError))
+                return false;
         }
 
         Json::Value const& lossFunctionScaleNode = node["lossFunctionScale"];
@@ -480,13 +809,26 @@ static bool ParseManifest(char const* jsonData, size_t jsonSize, char const* man
             return false;
         }
 
+        if (entry.mipLevel == 0)
+        {
+            auto const inserted = mip0EntryNames.insert(entry.entryName);
+            if (!inserted.second)
+            {
+                outError = "Malformed manifest: duplicate mip-0 texture name '" + entry.entryName +
+                    "'. Use a unique \"name\" per map, or omit \"name\" so it is derived from the full "
+                    "\"fileName\" path (folder + file).";
+                return false;
+            }
+        }
+
         outManifest.textures.push_back(entry);
     }
 
     return true;
 }
 
-bool ReadManifestFromFile(const char* fileName, Manifest& outManifest, std::string& outError)
+bool ReadManifestFromFile(const char* fileName, Manifest& outManifest, std::string& outError,
+    bool ignoreInlineSemantics)
 {
     FILE* inputFile = fopen(fileName, "rb");
     if (!inputFile)
@@ -509,7 +851,8 @@ bool ReadManifestFromFile(const char* fileName, Manifest& outManifest, std::stri
         return false;
     }
 
-    return ParseManifest(fileContents.data(), fileContents.size(), fileName, outManifest, outError);
+    return ParseManifest(fileContents.data(), fileContents.size(), fileName, outManifest, outError,
+        ignoreInlineSemantics);
 }
 
 bool ReadManifestFromStdin(Manifest& outManifest, std::string& outError)
@@ -525,12 +868,33 @@ bool ReadManifestFromStdin(Manifest& outManifest, std::string& outError)
 
     std::string const inputString = ss.str();
 
-    return ParseManifest(inputString.data(), inputString.size(), nullptr, outManifest, outError);
+    return ParseManifest(inputString.data(), inputString.size(), nullptr, outManifest, outError, false);
 }
 
-bool WriteManifestToFile(const char* fileName, const Manifest& manifest, std::string& outError)
+bool WriteManifestToFile(char const* fileName, Manifest const& manifest, std::string& outError,
+    char const* semanticsJsonPathUtf8)
 {
     fs::path const manifestDir = fs::absolute(fileName).parent_path();
+
+    std::string semanticsPath;
+    if (semanticsJsonPathUtf8 && semanticsJsonPathUtf8[0])
+        semanticsPath = semanticsJsonPathUtf8;
+    else
+    {
+        fs::path const sidecar = manifestDir / "semantics.json";
+        std::error_code ec;
+        if (fs::is_regular_file(sidecar, ec))
+            semanticsPath = sidecar.generic_string();
+    }
+
+    std::optional<std::unordered_map<std::string, Json::Value>> semanticsByNorm;
+    if (!semanticsPath.empty())
+    {
+        std::unordered_map<std::string, Json::Value> loaded;
+        if (!LoadSemanticsJsonFileIntoLookupMap(semanticsPath.c_str(), loaded, outError))
+            return false;
+        semanticsByNorm = std::move(loaded);
+    }
 
     Json::Value root;
     if (manifest.width.has_value())
@@ -582,19 +946,17 @@ bool WriteManifestToFile(const char* fileName, const Manifest& manifest, std::st
                 break;
         }
 
-        // Semantics
+        // Semantics: channel bindings only; sRGB is expressed only as top-level "isSRGB" (not duplicated here).
         if (!entry.semantics.empty())
         {
             Json::Value semanticsNode(Json::objectValue);
+            Json::Value const* semForEntry = nullptr;
+            if (semanticsByNorm.has_value())
+                semForEntry = FindSemanticsJsonObjectForEntry(*semanticsByNorm, entry);
             for (const auto& binding : entry.semantics)
             {
-                std::string labelStr = SemanticLabelToString(binding.label);
-                std::string channels;
-                static const char* channelMap = "RGBA";
-                int count = GetSemanticChannelCount(binding.label);
-                if (binding.firstChannel >= 0 && binding.firstChannel + count <= 4)
-                    channels.assign(channelMap + binding.firstChannel, channelMap + binding.firstChannel + count);
-                semanticsNode[labelStr] = channels;
+                std::string const channels = ResolveChannelStringForManifestWrite(semForEntry, binding);
+                semanticsNode[binding.name] = channels;
             }
             node["semantics"] = semanticsNode;
         }
@@ -631,13 +993,183 @@ bool WriteManifestToFile(const char* fileName, const Manifest& manifest, std::st
         return false;
     }
 
-    if (writer->write(root, &ofs) != 0)
+    // JsonCpp StreamWriter::write always returns 0; failures show up on the stream (see json.h on write()).
+    writer->write(root, &ofs);
+    ofs.flush();
+    if (!ofs.good())
     {
         outError = "Failed to write manifest JSON to file.";
         return false;
     }
 
     return true;
+}
+
+bool ReadManifestFromJsonString(char const* jsonUtf8, Manifest& outManifest, std::string& outError,
+    bool ignoreInlineSemantics)
+{
+    if (!jsonUtf8)
+    {
+        outError = "ReadManifestFromJsonString: null jsonUtf8";
+        return false;
+    }
+    size_t const len = std::strlen(jsonUtf8);
+    return ParseManifest(jsonUtf8, len, nullptr, outManifest, outError, ignoreInlineSemantics);
+}
+
+/** Lowercase + unify slashes so manifest \c "name" / paths match \c semantics.json root keys from Windows or Unix. */
+static void NormalizeSemanticsJsonRootKey(std::string& s)
+{
+    LowercaseString(s);
+    for (char& c : s)
+    {
+        if (c == '\\')
+            c = '/';
+    }
+}
+
+bool ReadSemanticsFromFileAndApplyToManifest(char const* semanticsJsonPathUtf8, Manifest& manifest,
+    std::string& outError)
+{
+    if (!semanticsJsonPathUtf8 || !semanticsJsonPathUtf8[0])
+    {
+        outError = "ReadSemanticsFromFileAndApplyToManifest: empty path.";
+        return false;
+    }
+
+    FILE* inputFile = fopen(semanticsJsonPathUtf8, "rb");
+    if (!inputFile)
+    {
+        std::ostringstream oss;
+        oss << "Cannot open semantics file '" << semanticsJsonPathUtf8 << "': " << strerror(errno);
+        outError = oss.str();
+        return false;
+    }
+
+    std::vector<char> fileContents;
+    bool success = ReadFileIntoVector(inputFile, fileContents);
+    fclose(inputFile);
+    if (!success)
+    {
+        std::ostringstream oss;
+        oss << "Error while reading semantics file '" << semanticsJsonPathUtf8 << "': " << strerror(errno);
+        outError = oss.str();
+        return false;
+    }
+
+    Json::CharReaderBuilder builder;
+    builder["collectComments"] = false;
+    Json::CharReader* reader = builder.newCharReader();
+    Json::Value root;
+    Json::String errorMessages;
+    if (!reader->parse(fileContents.data(), fileContents.data() + fileContents.size(), &root, &errorMessages))
+    {
+        std::ostringstream oss;
+        oss << "Cannot parse semantics file '" << semanticsJsonPathUtf8 << "': " << errorMessages;
+        outError = oss.str();
+        return false;
+    }
+
+    if (!root.isObject())
+    {
+        outError = "Malformed semantics file: root must be a JSON object mapping texture names to semantics objects.";
+        return false;
+    }
+
+    // Root keys normalized (case + slashes) so manifest "name" and fileName strings match semantics.json.
+    // Bindings are copied onto each manifest row (never moved out of the map): multiple rows share the
+    // same entryName (e.g. mip0/mip1) and must all receive the same semantics.
+    std::unordered_map<std::string, std::pair<std::vector<ImageSemanticBinding>, std::optional<bool>>> byName;
+    for (std::string const& texName : root.getMemberNames())
+    {
+        Json::Value const& semObj = root[texName];
+        if (!semObj.isObject())
+            continue;
+        std::vector<ImageSemanticBinding> bindings;
+        std::optional<bool> isSRGBFromSemantics;
+        if (!ParseSemanticsJsonObjectIntoBindings(semObj, texName.c_str(), bindings, isSRGBFromSemantics, outError))
+            return false;
+        std::string key = texName;
+        NormalizeSemanticsJsonRootKey(key);
+        byName[std::move(key)] = std::make_pair(std::move(bindings), std::move(isSRGBFromSemantics));
+    }
+
+    using SemanticsMapIt = std::unordered_map<std::string,
+        std::pair<std::vector<ImageSemanticBinding>, std::optional<bool>>>::iterator;
+    auto findByNormalizedKey = [&](std::string key) -> SemanticsMapIt {
+        NormalizeSemanticsJsonRootKey(key);
+        return byName.find(key);
+    };
+
+    auto findSemanticsForEntry = [&](ManifestEntry const& e) -> SemanticsMapIt {
+        SemanticsMapIt it = findByNormalizedKey(e.entryName);
+        if (it != byName.end())
+            return it;
+        if (!e.manifestJsonFileName.empty())
+        {
+            it = findByNormalizedKey(e.manifestJsonFileName);
+            if (it != byName.end())
+                return it;
+            it = findByNormalizedKey(DefaultEntryNameFromRelativeFileName(e.manifestJsonFileName));
+            if (it != byName.end())
+                return it;
+        }
+        it = findByNormalizedKey(DefaultEntryNameFromRelativeFileName(e.fileName));
+        if (it != byName.end())
+            return it;
+        it = findByNormalizedKey(fs::path(e.fileName).stem().generic_string());
+        if (it != byName.end())
+            return it;
+        return findByNormalizedKey(fs::path(e.fileName).filename().generic_string());
+    };
+
+    for (ManifestEntry& e : manifest.textures)
+    {
+        auto it = findSemanticsForEntry(e);
+        if (it == byName.end())
+        {
+            // No file entry for this texture: keep manifest-embedded semantics (already parsed).
+            continue;
+        }
+        e.semantics = it->second.first;
+        if (it->second.second.has_value())
+            e.isSRGB = true;
+        if (!DeriveChannelSwizzleFromSemanticsIfEmpty(e, outError))
+            return false;
+    }
+
+    return true;
+}
+
+static void CopyErrorToBuffer(std::string const& err, char* errBuf, int errBufChars)
+{
+    if (!errBuf || errBufChars <= 0)
+        return;
+    std::strncpy(errBuf, err.c_str(), static_cast<size_t>(errBufChars) - 1U);
+    errBuf[errBufChars - 1] = '\0';
+}
+
+extern "C" int NtcUtils_WriteManifestJsonFile(char const* outputPath, char const* jsonUtf8, char* errBuf,
+    int errBufChars)
+{
+    if (!outputPath || !jsonUtf8)
+    {
+        CopyErrorToBuffer("NtcUtils_WriteManifestJsonFile: null path or json", errBuf, errBufChars);
+        return 0;
+    }
+    Manifest manifest;
+    std::string err;
+    if (!ReadManifestFromJsonString(jsonUtf8, manifest, err))
+    {
+        CopyErrorToBuffer(err, errBuf, errBufChars);
+        return 0;
+    }
+    if (!WriteManifestToFile(outputPath, manifest, err))
+    {
+        CopyErrorToBuffer(err, errBuf, errBufChars);
+        return 0;
+    }
+    return 1;
 }
 
 void UpdateToolInputType(ToolInputType& current, ToolInputType newInput)

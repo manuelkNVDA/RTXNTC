@@ -14,6 +14,19 @@ project(ntc)
 
 set_property(GLOBAL PROPERTY USE_FOLDERS ON)
 
+# Detect a Windows ARM64 target and pick the matching binary architecture used to
+# select arch-specific redistributables (Agility SDK, DirectStorage). DX12 works
+# on ARM64; DLSS and OptiX have no Windows ARM64 support yet and default off below.
+if (WIN32 AND (CMAKE_SYSTEM_PROCESSOR MATCHES "^([Aa][Rr][Mm]64|[Aa][Aa][Rr][Cc][Hh]64)$"
+        OR CMAKE_GENERATOR_PLATFORM MATCHES "^([Aa][Rr][Mm]64)$"))
+    set(NTC_ARM64 ON)
+    set(NTC_WINDOWS_ARCH "arm64")
+    message(STATUS "NTC: Configuring for Windows ARM64")
+else()
+    set(NTC_ARM64 OFF)
+    set(NTC_WINDOWS_ARCH "x64")
+endif()
+
 option(NTC_WITH_TESTS "Build testing executables" ON)
 option(NTC_WITH_NVTT3 "Include NVTT3 library support for BCTest" OFF)
 set(NVTT3_SEARCH_PATH "" CACHE PATH "Custom search path for NVTT3")
@@ -28,7 +41,19 @@ else()
 endif()
 option(DONUT_WITH_VULKAN "" ON)
 option(DONUT_WITH_STATIC_SHADERS "" ON)
-option(DONUT_WITH_DLSS "" ${NTC_WITH_RENDERER})
+if (NTC_ARM64)
+    # DLSS/NGX ships only x86_64 libraries (no Windows ARM64), so keep it off here.
+    option(DONUT_WITH_DLSS "" OFF)
+else()
+    option(DONUT_WITH_DLSS "" ${NTC_WITH_RENDERER})
+endif()
+
+if (NTC_ARM64)
+    # OptiX host path is not validated on Windows ARM64 yet; off by default.
+    option(NTC_WITH_OPTIX "Compile with OptiX" OFF)
+else()
+    option(NTC_WITH_OPTIX "Compile with OptiX" ON)
+endif()
 
 # Forward the shader debug option to Donut to make sure that framework shaders like forward_vs also include debug info
 if (NTC_DEBUG_SHADERS)
@@ -43,7 +68,11 @@ if (MSVC)
 endif ()
 
 if (WIN32)
-    set(NTC_BINARY_DIR "${CMAKE_SOURCE_DIR}/bin/windows-x64" CACHE PATH "Output directory for the NTC SDK build")
+    if (NTC_ARM64)
+        set(NTC_BINARY_DIR "${CMAKE_SOURCE_DIR}/bin/windows-arm64" CACHE PATH "Output directory for the NTC SDK build")
+    else()
+        set(NTC_BINARY_DIR "${CMAKE_SOURCE_DIR}/bin/windows-x64" CACHE PATH "Output directory for the NTC SDK build")
+    endif()
 else()
     set(NTC_BINARY_DIR "${CMAKE_SOURCE_DIR}/bin/linux-x64" CACHE PATH "Output directory for the NTC SDK build")
 endif()
@@ -114,7 +143,7 @@ option(NTC_WITH_VULKAN "" "${DONUT_WITH_VULKAN}")
 add_subdirectory(libraries/RTXNTC-Library)
 
 if (DONUT_WITH_DX12)
-    set(DONUT_D3D_AGILITY_SDK_URL "https://www.nuget.org/api/v2/package/Microsoft.Direct3D.D3D12/1.717.1-preview")
+    set(DONUT_D3D_AGILITY_SDK_URL "https://www.nuget.org/api/v2/package/Microsoft.Direct3D.D3D12/1.721.0-preview")
     set(DONUT_D3D_AGILITY_SDK_FETCH_DIR "${CMAKE_CURRENT_SOURCE_DIR}/external/dx12-agility-sdk" CACHE STRING "" FORCE)
     include("${CMAKE_CURRENT_SOURCE_DIR}/external/donut/cmake/FetchAgilitySDK.cmake")
     include(ConfigureAgilitySDK)
@@ -129,8 +158,8 @@ if (DONUT_WITH_DX12)
     FetchContent_MakeAvailable(DirectStorageSDK)
 
     file(COPY 
-        "${DIRECTSTORAGE_SDK_PATH}/native/bin/x64/dstorage.dll" 
-        "${DIRECTSTORAGE_SDK_PATH}/native/bin/x64/dstoragecore.dll"
+        "${DIRECTSTORAGE_SDK_PATH}/native/bin/${NTC_WINDOWS_ARCH}/dstorage.dll" 
+        "${DIRECTSTORAGE_SDK_PATH}/native/bin/${NTC_WINDOWS_ARCH}/dstoragecore.dll"
         DESTINATION "${NTC_BINARY_DIR}")
 endif()
 

@@ -18,6 +18,7 @@
 #include <ntc-utils/GraphicsImageDifferencePass.h>
 #include <ntc-utils/GraphicsBlockCompressionPass.h>
 #include <ntc-utils/Manifest.h>
+#include <ntc-utils/Semantics.h>
 #include <tinyexr.h>
 #include <filesystem>
 #include <donut/core/log.h>
@@ -82,7 +83,8 @@ bool CreateGraphicsResourcesFromMetadata(
         }
 
         GraphicsResourcesForTexture textureResources(context);
-        textureResources.name = name;
+        // Texture names carry a "|ntcsem:...|" suffix; strip it since ':' and '|' are illegal in filenames on Windows.
+        textureResources.name = StripNtcSemanticsSuffixForDisplay(name ? name : "");
 
         auto colorTextureDesc = nvrhi::TextureDesc()
             .setDebugName(name)

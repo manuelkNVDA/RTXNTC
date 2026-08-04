@@ -34,6 +34,9 @@
 #include <sstream>
 #include <tinyexr.h>
 #include <unordered_set>
+#include <algorithm>
+#include <array>
+#include <cstring>
 #include <libntc/ntc.h>
 #include <imgui_internal.h>
 #include <cuda_runtime_api.h>
@@ -1025,7 +1028,7 @@ public:
         {
             for (auto& semantic : m_semanticBindings)
             {
-                if (semantic.label == SemanticLabel::Albedo)
+                if (ManifestSemanticNameEqualsInsensitive(semantic.name, "Albedo"))
                     m_selectedImage = semantic.imageIndex;
             }
         }
@@ -1269,16 +1272,17 @@ public:
         {
             if (!m_loadedManifestFile)
             {
-                // When we've enumerated files in a folder, guess the sRGB colorspace and semantics.
-                GuessImageSemantics(image.name, image.channels, image.format, imageIndex,
-                    image.isSRGB, m_semanticBindings);
+                // Folder / file-list manifest has no inline semantics; optional "|ntcsem:..." in names only.
+                GuessImageSemantics(image.name, image.channels, image.format, imageIndex, image.isSRGB,
+                    m_semanticBindings);
             }
             else
             {
                 // When we've used a manifest file, take the semantics from that file.
                 for (ImageSemanticBinding const& binding : image.manifestSemantics)
                 {
-                    m_semanticBindings.push_back({ binding.label, imageIndex, binding.firstChannel });
+                    m_semanticBindings.push_back(
+                        { binding.name, imageIndex, binding.firstChannel, binding.numChannels });
                 }
             }
             
@@ -1978,7 +1982,7 @@ public:
         if (m_useAlphaMaskChannel)
         {
             for (auto& semanticBinding : m_semanticBindings)
-                if (semanticBinding.label == SemanticLabel::AlphaMask)
+                if (ManifestSemanticNameIsAlphaMask(semanticBinding.name))
                 {
                     m_alphaMaskChannelIndex = m_images[semanticBinding.imageIndex].firstChannel + semanticBinding.firstChannel;
                     break;
@@ -2053,8 +2057,9 @@ public:
                 if (m_images[binding.imageIndex].manifestIndex == manifestIndex)
                 {
                     ImageSemanticBinding imageBinding;
-                    imageBinding.label = binding.label;
+                    imageBinding.name = binding.name;
                     imageBinding.firstChannel = binding.firstChannel;
+                    imageBinding.numChannels = binding.numChannels;
                     texture.semantics.push_back(imageBinding);
                 }
             }
@@ -2226,7 +2231,8 @@ public:
             const auto getImageChannelLabel = [this](int imageIndex, int firstChannel, int numChannels)
             {
                 static const std::string channels = "RGBA";
-                return m_images[imageIndex].name + "." + channels.substr(firstChannel, numChannels);
+                return StripNtcSemanticsSuffixForDisplay(m_images[imageIndex].name) + "." +
+                    channels.substr(firstChannel, numChannels);
             };
 
             int bindingIndex = 0;
@@ -2235,26 +2241,33 @@ public:
             {
                 ImGui::PushID(bindingIndex);
 
-                ImGui::PushItemWidth(fontSize * 7.5f);
-                if (ImGui::BeginCombo("##SemanticLabel", SemanticLabelToString(semanticBinding.label)))
+                ImGui::PushItemWidth(fontSize * 10.f);
                 {
-                    for (int label = 0; label < int(SemanticLabel::Count); ++label)
-                    {
-                        bool selected = int(semanticBinding.label) == label;
-                        ImGui::Selectable(SemanticLabelToString(SemanticLabel(label)), &selected);
-
-                        if (selected)
-                        {
-                            ImGui::SetItemDefaultFocus();
-                            semanticBinding.label = SemanticLabel(label);
-                        }
-                    }
-                    ImGui::EndCombo();
+                    std::array<char, 256> nameBuf{};
+                    (void)std::strncpy(nameBuf.data(), semanticBinding.name.c_str(), nameBuf.size() - 1);
+                    if (ImGui::InputText("##SemanticName", nameBuf.data(), nameBuf.size()))
+                        semanticBinding.name.assign(nameBuf.data());
                 }
-                
+                ImGui::SameLine();
+                ImGui::PushItemWidth(fontSize * 5.f);
+                ImGui::SliderInt("##SemNumCh", &semanticBinding.numChannels, 1, 4);
+                ImGui::PopItemWidth();
+
+                if (semanticBinding.imageIndex >= 0 && semanticBinding.imageIndex < int(m_images.size()))
+                {
+                    int const ic = m_images[semanticBinding.imageIndex].channels;
+                    semanticBinding.numChannels = std::clamp(semanticBinding.numChannels, 1, std::min(4, ic));
+                    semanticBinding.firstChannel =
+                        std::clamp(semanticBinding.firstChannel, 0, std::max(0, ic - semanticBinding.numChannels));
+                }
+                else
+                {
+                    semanticBinding.numChannels = std::clamp(semanticBinding.numChannels, 1, 4);
+                }
+
                 ImGui::SameLine();
 
-                const int numChannels = GetSemanticChannelCount(semanticBinding.label);
+                int const numChannels = std::max(1, semanticBinding.numChannels);
                 if (ImGui::BeginCombo("##SemanticImage", getImageChannelLabel(semanticBinding.imageIndex, semanticBinding.firstChannel, numChannels).c_str()))
                 {
                     int imageIndex = 0;

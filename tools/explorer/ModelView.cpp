@@ -292,40 +292,44 @@ void ModelView::Render(nvrhi::ICommandList* commandList, nvrhi::IFramebuffer* fr
 
     for (const auto& semantic : m_semanticBindings)
     {
-        switch(semantic.label)
+        if (ManifestSemanticNameEqualsInsensitive(semantic.name, "Albedo"))
         {
-            case SemanticLabel::Albedo:
-                constants.albedoTexture = semantic.imageIndex + imageOffset;
-                constants.albedoChannel = semantic.firstChannel;
-                break;
-            case SemanticLabel::AlphaMask:
-                constants.alphaTexture = semantic.imageIndex + imageOffset;
-                constants.alphaChannel = semantic.firstChannel;
-                break;
-            case SemanticLabel::Displacement:
-                // Can't really use it here...
-                break;
-            case SemanticLabel::Emissive:
-                constants.emissiveTexture = semantic.imageIndex + imageOffset;
-                constants.emissiveChannel = semantic.firstChannel;
-                break;
-            case SemanticLabel::Metalness:
-                constants.metalnessTexture = semantic.imageIndex + imageOffset;
-                constants.metalnessChannel = semantic.firstChannel;
-                break;
-            case SemanticLabel::Normal:
-                constants.normalTexture = semantic.imageIndex + imageOffset;
-                constants.normalChannel = semantic.firstChannel;
-                break;
-            case SemanticLabel::Occlusion:
-                constants.occlusionTexture = semantic.imageIndex + imageOffset;
-                constants.occlusionChannel = semantic.firstChannel; 
-                break;
-            case SemanticLabel::Roughness:
-                constants.roughnessTexture = semantic.imageIndex + imageOffset;
-                constants.roughnessChannel = semantic.firstChannel;
-                break;
-            default: ;
+            constants.albedoTexture = semantic.imageIndex + imageOffset;
+            constants.albedoChannel = semantic.firstChannel;
+        }
+        else if (ManifestSemanticNameIsAlphaMask(semantic.name))
+        {
+            constants.alphaTexture = semantic.imageIndex + imageOffset;
+            constants.alphaChannel = semantic.firstChannel;
+        }
+        else if (ManifestSemanticNameEqualsInsensitive(semantic.name, "Displacement"))
+        {
+            // Can't really use it here...
+        }
+        else if (ManifestSemanticNameEqualsInsensitive(semantic.name, "Emissive"))
+        {
+            constants.emissiveTexture = semantic.imageIndex + imageOffset;
+            constants.emissiveChannel = semantic.firstChannel;
+        }
+        else if (ManifestSemanticNameEqualsInsensitive(semantic.name, "Metalness"))
+        {
+            constants.metalnessTexture = semantic.imageIndex + imageOffset;
+            constants.metalnessChannel = semantic.firstChannel;
+        }
+        else if (ManifestSemanticNameEqualsInsensitive(semantic.name, "Normal"))
+        {
+            constants.normalTexture = semantic.imageIndex + imageOffset;
+            constants.normalChannel = semantic.firstChannel;
+        }
+        else if (ManifestSemanticNameEqualsInsensitive(semantic.name, "Occlusion"))
+        {
+            constants.occlusionTexture = semantic.imageIndex + imageOffset;
+            constants.occlusionChannel = semantic.firstChannel;
+        }
+        else if (ManifestSemanticNameEqualsInsensitive(semantic.name, "Roughness"))
+        {
+            constants.roughnessTexture = semantic.imageIndex + imageOffset;
+            constants.roughnessChannel = semantic.firstChannel;
         }
     }
 

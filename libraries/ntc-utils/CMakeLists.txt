@@ -68,11 +68,11 @@ target_compile_definitions(ntc-utils PUBLIC
     NTC_WITH_DX12=$<BOOL:${DONUT_WITH_DX12}>
     NTC_WITH_VULKAN=$<BOOL:${DONUT_WITH_VULKAN}>)
 
-if (WIN32)
+if (WIN32 AND DONUT_WITH_DX12)
     target_compile_definitions(ntc-utils PRIVATE
         DONUT_D3D_AGILITY_SDK_VERSION=${DONUT_D3D_AGILITY_SDK_VERSION})
 endif()
 if (DONUT_WITH_DX12)
     target_include_directories(ntc-utils PUBLIC "${DIRECTSTORAGE_SDK_PATH}/native/include")
-    target_link_libraries(ntc-utils PUBLIC "${DIRECTSTORAGE_SDK_PATH}/native/lib/x64/dstorage.lib")
+    target_link_libraries(ntc-utils PUBLIC "${DIRECTSTORAGE_SDK_PATH}/native/lib/${NTC_WINDOWS_ARCH}/dstorage.lib")
 endif()

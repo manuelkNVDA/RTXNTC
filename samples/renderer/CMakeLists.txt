@@ -112,6 +112,9 @@ else()
     set(debug_option "")
 endif()
 
+cmake_path(GET SHADERMAKE_DXC_PATH PARENT_PATH dxc_directory)
+set(dxc_include_directory "${dxc_directory}/../../inc/hlsl")
+
 donut_compile_shaders_all_platforms(
     TARGET ntc-renderer-shaders
     PROJECT_NAME "NTC Renderer"
@@ -134,8 +137,8 @@ donut_compile_shaders(
     BYPRODUCTS ${shader_outputs_coopvec_dxil}
     OUTPUT_FORMAT HEADER
     DXIL ${shader_output_dir}
-    INCLUDES ${libntc_include_directory} ${libstf_include_directory}
-    SHADER_MODEL 6_9
+    INCLUDES ${libntc_include_directory} ${libstf_include_directory} ${dxc_include_directory}
+    SHADER_MODEL 6_10
     SHADERMAKE_OPTIONS "${debug_option}"
 )
 
@@ -147,7 +150,7 @@ donut_compile_shaders(
     BYPRODUCTS ${shader_outputs_coopvec_spirv}
     OUTPUT_FORMAT HEADER
     SPIRV_SLANG ${shader_output_dir}
-    INCLUDES ${libntc_include_directory} ${libstf_include_directory}
+    INCLUDES ${libntc_include_directory} ${libstf_include_directory} ${dxc_include_directory}
     SHADERMAKE_OPTIONS "${debug_option}"
     SHADERMAKE_OPTIONS_SPIRV "-X \"-capability spvCooperativeVectorNV\""
 )

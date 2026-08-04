@@ -30,6 +30,7 @@ from argparse import Namespace
 import subprocess
 import re
 import os
+import platform
 import signal
 import sys
 import threading
@@ -41,17 +42,25 @@ def get_sdk_root_path():
     "Returns the path to the NTC SDK root, assuming the original SDK directory structure."
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+def get_binary_dir():
+    "Returns the bin/ subdirectory for the current OS and CPU architecture (mirrors the CMake NTC_BINARY_DIR logic)."
+    if os.name == 'nt':
+        is_arm64 = platform.machine().lower() in ('arm64', 'aarch64')
+        return 'bin/windows-arm64' if is_arm64 else 'bin/windows-x64'
+    else:
+        return 'bin/linux-x64'
+
 def get_default_tool_path():
     "Returns the path to the ntc-cli tool, assuming the original SDK directory structure."
     sdkroot = get_sdk_root_path()
-    filename = 'bin/windows-x64/ntc-cli.exe' if os.name == 'nt' else 'bin/linux-x64/ntc-cli'
-    return os.path.join(sdkroot, filename)
+    filename = 'ntc-cli.exe' if os.name == 'nt' else 'ntc-cli'
+    return os.path.join(sdkroot, get_binary_dir(), filename)
 
 def get_default_imagediff_path():
     "Returns the path to the imagediff tool, assuming the original SDK directory structure."
     sdkroot = get_sdk_root_path()
-    filename = 'bin/windows-x64/imagediff.exe' if os.name == 'nt' else 'bin/linux-x64/imagediff'
-    return os.path.join(sdkroot, filename)
+    filename = 'imagediff.exe' if os.name == 'nt' else 'imagediff'
+    return os.path.join(sdkroot, get_binary_dir(), filename)
 
 @dataclass
 class LatentShape:

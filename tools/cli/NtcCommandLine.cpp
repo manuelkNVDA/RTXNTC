@@ -28,6 +28,10 @@
 #include "GraphicsPasses.h"
 #include "Utils.h"
 
+#if NTC_WITH_OPTIX
+#include "OptixDecompressor.h"
+#endif
+
 namespace fs = std::filesystem;
 
 struct
@@ -38,6 +42,8 @@ struct
     const char* loadCompressedFileName = nullptr;
     const char* saveCompressedFileName = nullptr;
     const char* saveManifestFileName = nullptr;
+    /** Optional: semantics.json path for resolving channel strings when writing --saveManifest (see Manifest.h). */
+    const char* writeManifestSemanticsJson = nullptr;
     ToolInputType inputType = ToolInputType::None;
     std::vector<char const*> loadImagesList;
     std::optional<ntc::BlockCompressedFormat> bcFormat;
@@ -49,8 +55,9 @@ struct
     bool saveMips = false;
     bool generateMips = false;
     bool optimizeBC = false;
-    bool useVulkan = false;
     bool useDX12 = false;
+    bool useOptix = false;
+    bool useVulkan = false;
     bool debug = false;
     bool listAdapters = false;
     bool listCudaDevices = false;
@@ -103,6 +110,9 @@ bool ProcessCommandLine(int argc, const char** argv)
         OPT_STRING ('o', "saveCompressed", &g_options.saveCompressedFileName, "Save compressed texture set into the specified file"),
         OPT_STRING ('i', "saveImages", &g_options.saveImagesPath, "Save channel images into the specified folder"),
         OPT_STRING (0,   "saveManifest", &g_options.saveManifestFileName, "Save a manifest JSON file (only for image inputs)"),
+        OPT_STRING (0,   "writeManifestSemanticsJson", &g_options.writeManifestSemanticsJson,
+            "With --saveManifest, use this semantics.json for per-slot channel strings (R/RGB/...); if omitted, "
+            "semantics.json beside the manifest path is used when present"),
         OPT_BOOLEAN(0,   "saveMips", &g_options.saveMips, "Save MIP level images into <saveImages>/mips/ after decompression"),
         OPT_BOOLEAN(0,   "version", &g_options.printVersion, "Print version information and exit"),
         OPT_HELP(),
@@ -161,6 +171,9 @@ bool ProcessCommandLine(int argc, const char** argv)
 #if NTC_WITH_VULKAN
         OPT_BOOLEAN(0, "vk", &g_options.useVulkan, "Use Vulkan API for graphics operations"),
 #endif
+#if NTC_WITH_OPTIX
+        OPT_BOOLEAN(0, "optix", &g_options.useOptix, "Use OptiX API for decompression"),
+#endif
         OPT_END()
     };
 
@@ -201,6 +214,12 @@ bool ProcessCommandLine(int argc, const char** argv)
     if (g_options.useVulkan && g_options.useDX12)
     {
         fprintf(stderr, "Options --vk and --dx12 cannot be used at the same time.\n");
+        return false;
+    }
+
+    if (g_options.useOptix && (g_options.useVulkan || g_options.useDX12))
+    {
+        fprintf(stderr, "Option --optix cannot be used with --vk or --dx12.\n");
         return false;
     }
 
@@ -514,6 +533,8 @@ bool SaveImagesFromTextureSet(ntc::IContext* context, ntc::ITextureSet* textureS
         }
 
         const char* textureName = texture->GetName();
+        // Strip the "|ntcsem:...|" semantics suffix; ':' and '|' are illegal in filenames on Windows.
+        std::string const textureFileName = StripNtcSemanticsSuffixForDisplay(textureName ? textureName : "");
         int firstChannel = 0;
         int numChannels = 0;
         texture->GetChannels(firstChannel, numChannels);
@@ -581,7 +602,7 @@ bool SaveImagesFromTextureSet(ntc::IContext* context, ntc::ITextureSet* textureS
             std::string outputFileName;
             if (g_options.saveMips && mip > 0)
             {
-                outputFileName = (outputPath / "mips" / textureName).generic_string();
+                outputFileName = (outputPath / "mips" / textureFileName).generic_string();
 
                 char mipStr[8];
                 snprintf(mipStr, sizeof(mipStr), ".%02d", mip);
@@ -589,7 +610,7 @@ bool SaveImagesFromTextureSet(ntc::IContext* context, ntc::ITextureSet* textureS
             }
             else
             {
-                outputFileName = (outputPath / textureName).generic_string();
+                outputFileName = (outputPath / textureFileName).generic_string();
             }
             
             outputFileName += GetContainerExtension(container);
@@ -698,7 +719,7 @@ void OverrideTextureBcFormat(ntc::ITextureMetadata* texture, ManifestEntry* mani
     }
 }
 
-ntc::ITextureSet* LoadImages(ntc::IContext* context, Manifest& manifest, bool manifestIsGenerated)
+ntc::ITextureSet* LoadImages(ntc::IContext* context, Manifest& manifest)
 {
     ntc::TextureSetDesc textureSetDesc{};
     textureSetDesc.mips = 1;
@@ -860,6 +881,7 @@ ntc::ITextureSet* LoadImages(ntc::IContext* context, Manifest& manifest, bool ma
                 image->width, image->height, image->channels);
 
             image->channelSwizzle = entry.channelSwizzle;
+            ClampChannelSwizzleToSourceChannelCount(image->channelSwizzle, image->channels);
             if (image->channelSwizzle.empty())
                 image->storedChannels = image->channels;
             else
@@ -868,7 +890,7 @@ ntc::ITextureSet* LoadImages(ntc::IContext* context, Manifest& manifest, bool ma
             // Find the alpha mask semantic in the manifest, store the channel index
             for (ImageSemanticBinding const& binding : entry.semantics)
             {
-                if (binding.label == SemanticLabel::AlphaMask)
+                if (ManifestSemanticNameIsAlphaMask(binding.name))
                 {
                     image->alphaMaskChannel = binding.firstChannel; // Default value is -1 which means "none"
                 }
@@ -915,37 +937,6 @@ ntc::ITextureSet* LoadImages(ntc::IContext* context, Manifest& manifest, bool ma
         return nullptr;
     }
     
-    // Auto-generate the semantics and sRGB flags after loading the images: this needs per-image channel counts
-
-    if (manifestIsGenerated)
-    {
-        std::vector<SemanticBinding> semantics;
-        for (auto& image : images)
-        {
-            // We don't (currently) need the global semantic table, but we do look fir the alpha mask below
-            semantics.clear();
-
-            GuessImageSemantics(image->name, image->channels, image->channelFormat, image->manifestIndex,
-                image->isSRGB, semantics);
-            
-            // Copy the generated semantics into the manifest in case the user requested to save the manifest
-            ManifestEntry& manifestEntry = manifest.textures[image->manifestIndex];
-            manifestEntry.isSRGB = image->isSRGB;
-
-            // If one of the channels is the alpha mask, remember that
-            for (auto const& binding : semantics)
-            {
-                if (binding.label == SemanticLabel::AlphaMask)
-                    image->alphaMaskChannel = binding.firstChannel;
-
-                ImageSemanticBinding manifestBinding;
-                manifestBinding.label = binding.label;
-                manifestBinding.firstChannel = binding.firstChannel;
-                manifestEntry.semantics.push_back(manifestBinding);
-            }
-        }
-    }
-
     // Load the other mips
 
     for (const auto& entry : manifest.textures)
@@ -1306,7 +1297,9 @@ ntc::ITextureSet* LoadImages(ntc::IContext* context, Manifest& manifest, bool ma
         }
         
         ntc::ITextureMetadata* texture = textureSet->AddTexture();
-        texture->SetName(image->name.c_str());
+        ManifestEntry const& ment = manifest.textures[image->manifestIndex];
+        std::string const metaName = BuildTextureNameWithEmbeddedSemantics(image->name, ment.semantics);
+        texture->SetName(metaName.c_str());
         texture->SetChannels(image->firstChannel, image->storedChannels);
         texture->SetChannelFormat(image->channelFormat);
         texture->SetBlockCompressedFormat(image->bcFormat);
@@ -1471,6 +1464,7 @@ bool CompressTextureSetWithTargetPSNR(ntc::IContext* context, ntc::ITextureSet* 
 bool DecompressTextureSet(ntc::IContext* context, ntc::ITextureSet* textureSet, bool useInt8Weights)
 {
     ntc::DecompressionStats stats;
+
     ntc::Status ntcStatus = textureSet->Decompress(&stats, useInt8Weights);
     CHECK_NTC_RESULT(Decompress);
 
@@ -1605,6 +1599,58 @@ ntc::ITextureSet* LoadCompressedTextureSet(ntc::IContext* context)
     }
     
     return textureSet;
+}
+
+bool DecompressTextureSetWithOptix(ntc::IContext* context, ntc::ITextureSet* textureSet, const char* inputFileName)
+{
+#if NTC_WITH_OPTIX
+    ntc::FileStreamWrapper inputStream(context);
+    ntc::Status ntcStatus = context->OpenFile(inputFileName, false, inputStream.ptr());
+    if (ntcStatus != ntc::Status::Ok)
+    {
+        fprintf(stderr, "Failed to open input file '%s', code = %s: %s\n", inputFileName,
+            ntc::StatusToString(ntcStatus), ntc::GetLastErrorMessage());
+        return false;
+    }
+
+    ntc::TextureSetMetadataWrapper metadata(context);
+    ntcStatus = context->CreateTextureSetMetadataFromStream(inputStream, metadata.ptr());
+    if (ntcStatus != ntc::Status::Ok)
+    {
+        fprintf(stderr, "Failed to load texture set metadata from '%s', code = %s: %s\n", inputFileName,
+            ntc::StatusToString(ntcStatus), ntc::GetLastErrorMessage());
+        return false;
+    }
+
+    OptixDecompressor optixDecompressor(context, metadata.Get(), inputStream.Get());
+    const char* errorMessage = optixDecompressor.prepareDecompression();
+    if( errorMessage )
+    {
+        fprintf(stderr, "Error. OptiX decompression preparation: %s\n", errorMessage);
+        return false;
+    }
+
+    // Decompress the mip levels separately
+    float timeInMilliseconds = 0.0f;
+    ntc::TextureSetDesc textureSetDesc = textureSet->GetDesc();
+    for (int mipLevel = 0; mipLevel < textureSetDesc.mips; mipLevel++)
+    {
+        half* outputImage = reinterpret_cast<half*>(textureSet->GetOutputMipSliceDevicePointer(mipLevel));
+        float mipLevelTime = 0.0f;
+        const char* errorMessage = optixDecompressor.DecompressMipLevel(outputImage, mipLevel, mipLevelTime);
+        if( errorMessage )
+        {
+            fprintf(stderr, "Error. OptiX decompression mip level %d: %s\n", mipLevel, errorMessage);
+            return false;
+        }
+        timeInMilliseconds += mipLevelTime;
+    }
+    printf("OptiX decompression time: %.3f ms\n", timeInMilliseconds);
+
+    return true;
+#endif
+
+    return false;
 }
 
 donut::app::DeviceCreationParameters GetGraphicsDeviceParameters(nvrhi::GraphicsAPI graphicsApi)
@@ -2123,14 +2169,14 @@ int main(int argc, const char** argv)
                 assert(g_options.loadImagesPath);
 
                 GenerateManifestFromDirectory(g_options.loadImagesPath, g_options.loadMips, g_options.keepFileNames, manifest);
-                *textureSet.ptr() = LoadImages(context, manifest, true);
+                *textureSet.ptr() = LoadImages(context, manifest);
                 break;
             }
             case ToolInputType::Images: {
                 assert(!g_options.loadImagesList.empty());
 
                 GenerateManifestFromFileList(g_options.loadImagesList, g_options.keepFileNames, manifest);
-                *textureSet.ptr() = LoadImages(context, manifest, true);
+                *textureSet.ptr() = LoadImages(context, manifest);
                 break;
             }
             case ToolInputType::ManifestFile: {
@@ -2143,7 +2189,7 @@ int main(int argc, const char** argv)
                     return 1;
                 }
 
-                *textureSet.ptr() = LoadImages(context, manifest, false);
+                *textureSet.ptr() = LoadImages(context, manifest);
                 break;
             }
             case ToolInputType::ManifestStdin: {
@@ -2154,7 +2200,7 @@ int main(int argc, const char** argv)
                     return 1;
                 }
 
-                *textureSet.ptr() = LoadImages(context, manifest, false);
+                *textureSet.ptr() = LoadImages(context, manifest);
                 break;
             }
             case ToolInputType::CompressedTextureSet: {
@@ -2187,7 +2233,8 @@ int main(int argc, const char** argv)
         if (g_options.saveManifestFileName)
         {
             std::string manifestError;
-            if (!WriteManifestToFile(g_options.saveManifestFileName, manifest, manifestError))
+            if (!WriteManifestToFile(g_options.saveManifestFileName, manifest, manifestError,
+                    g_options.writeManifestSemanticsJson))
             {
                 fprintf(stderr, "%s\n", manifestError.c_str());
                 return 1;
@@ -2258,7 +2305,7 @@ int main(int argc, const char** argv)
             }
         }
 
-        if (g_options.decompress)
+        if (g_options.decompress && !g_options.useOptix)
         {
             if (g_options.compress)
             {
@@ -2267,6 +2314,12 @@ int main(int argc, const char** argv)
             }
 
             if (!DecompressTextureSet(context, textureSet, /* useInt8Weights = */ false))
+                return 1;
+        }
+
+        if (g_options.decompress && g_options.useOptix && g_options.loadCompressedFileName)
+        {
+            if( !DecompressTextureSetWithOptix(context, textureSet, g_options.loadCompressedFileName) )
                 return 1;
         }
 

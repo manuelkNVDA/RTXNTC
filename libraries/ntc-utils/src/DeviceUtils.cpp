@@ -158,7 +158,7 @@ void SetNtcGraphicsDeviceParameters(
     g_dx12DeveloperModeEnabled = false;
     if (graphicsApi == nvrhi::GraphicsAPI::D3D12 && enableDX12ExperimentalFeatures)
     {
-        UUID Features[] = { D3D12ExperimentalShaderModels, D3D12CooperativeVectorExperiment };
+        UUID Features[] = { D3D12ExperimentalShaderModels };
         HRESULT hr = D3D12EnableExperimentalFeatures(_countof(Features), Features, nullptr, nullptr);
 
         if (FAILED(hr))

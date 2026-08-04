@@ -17,6 +17,7 @@ import sys
 import shutil
 import numpy
 from PIL import Image
+import subprocess
 
 try:
     import OpenEXR
@@ -85,6 +86,17 @@ def _loadAutoImage(filename: str):
     else:
         return _loadPillowImage(filename)
 
+def _isOptixSupported():
+    try:
+        result = subprocess.run(
+            [ntc.get_default_tool_path(), '--help'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        return '--optix' in result.stdout
+    except:
+        return False
 
 class TestCase(unittest.TestCase):
 
@@ -357,6 +369,34 @@ class HdrCompressionTestCase(TestCase):
         self.assertBetween(psnr, 38, 42)
 
 
+class OptixDecompressionTestCase(TestCase):
+
+    def __str__(self):
+        return 'OptiX Decompression'
+
+    def runTest(self):
+        sourceMaterialDir = os.path.join(sourceDir, 'PavingStones070')
+        ntcFileName = os.path.join(testFilesDir, f'PavingStones070_5bpp.ntc')
+        decompressedDir = os.path.join(scratchDir, 'output_optix')
+
+        args = ntc.Arguments(
+            tool=self.tool,
+            cudaDevice=_CUDA_DEVICE,
+            loadCompressed=ntcFileName,
+            decompress=True,
+            saveImages=decompressedDir,
+            imageFormat='tga',
+            bcFormat='none',
+            customArguments='--optix'
+        )
+
+        result = ntc.run(args)
+        self.assertFileExists(os.path.join(decompressedDir, 'Color.tga'))
+
+        # Expected PSNR values should be about the same as CUDA decompression
+        expectedPsnr = (34.3, 30.4, 40.0, 29.5, 35.8)
+        self.compareOutputImages(sourceMaterialDir, decompressedDir, expectedPsnr, toleranceDb=1.5, ignoreExtraChannels=False)
+
 class DecompressionTestCase(TestCase):
 
     def __init__(self, api: str, featureLevel: int) -> None:
@@ -477,6 +517,7 @@ if __name__ == '__main__':
     parser.add_argument('--adapterDX12', metavar = 'N', type = int, help = 'Graphics adapter index for DX12')
     parser.add_argument('--noCoopVecVK', action = 'store_true', help = 'Disable CoopVec on VK')
     parser.add_argument('--noCoopVecDX12', action = 'store_true', help = 'Disable CoopVec on DX12')
+    parser.add_argument('--noOptix', action = 'store_true', help = 'Disable OptiX tests')
     args = parser.parse_args()
 
     gDevice = args.cudaDevice
@@ -501,5 +542,9 @@ if __name__ == '__main__':
                 suite.addTest(DecompressionTestCase(api=api, featureLevel=featureLevel))
             suite.addTest(BlockCompressionTestCase(api=api))
     
+    # OptiX decompression test
+    if not args.noOptix and _isOptixSupported():
+        suite.addTest(OptixDecompressionTestCase())
+
     runner = unittest.TextTestRunner(verbosity=2)
     runner.run(suite)
