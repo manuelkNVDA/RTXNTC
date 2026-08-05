@@ -53,7 +53,7 @@ In order to provide robust backwards compatibility, fallback implementations of 
 > ### WARNING: Pre-Release Feature Dependency for Direct3D 12
 > NTC texture decompression for DX12 applications, both on-load and on-sample, relies on a preview version of the [Microsoft DirectX 12 Agility SDK](https://devblogs.microsoft.com/directx/directx12agility/), specifically, `1.721.0-preview`. In order for the [LinAlg](https://devblogs.microsoft.com/directx/d3d12-linalg-preview/) (formerly Cooperative Vector) extensions to work, the application must enable the `D3D12ExperimentalShaderModels` feature, which requires that Windows is configured to be in the Developer Mode. 
 >
-> A pre-release NVIDIA GPU driver version 615 or later is required for Shader Model 6.9 functionality.
+> A pre-release NVIDIA GPU driver version 620.12 or later is required for Shader Model 6.10 (LinAlg) functionality.
 > 
 > All non-CoopVec versions of DX12 decompression, as well as all Vulkan versions including CoopVec, are OK to use for shipping.
 >
@@ -118,10 +118,9 @@ GPU for NTC compression:
 
 _[*] The oldest GPUs that the NTC SDK functionality has been validated on are NVIDIA GTX 1000 series, AMD Radeon RX 6000 series, Intel Arc A series._
 
-For Cooperative Vector support on NVIDIA GPUs, please use the NVIDIA Graphics Driver preview version 615 or newer for DX12, or at least version 570 for Vulkan. The preview drivers can be downloaded using the following links (require an NVIDIA Developer Program account):
+For Cooperative Vector support on NVIDIA GPUs, please use the NVIDIA Graphics Driver preview version 620.12 or newer for DX12 (Shader Model 6.10 / LinAlg), or at least version 570 for Vulkan. On Windows ARM64 the required driver comes with the ARM64 CUDA Toolkit (see the Windows ARM64 section below). The preview driver can be downloaded using the following link (requires an NVIDIA Developer Program account):
 
-- GeForce GPUs: https://developer.nvidia.com/downloads/shadermodel6-9-preview-driver
-- Quadro GPUs: https://developer.nvidia.com/downloads/assets/secure/shadermodel6-9-preview-driver-quadro
+- GeForce GPUs: https://developer.nvidia.com/downloads/assets/secure/geforce-drivers/620.12_gameready_win11_win10-dch_64bit_international.exe
 
 For a list of software components needed to build the SDK, please refer to the [Build Guide](#build-guide).
 
