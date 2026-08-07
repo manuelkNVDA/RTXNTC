@@ -25,7 +25,37 @@ The root of the manifest document is an object with the following fields.
 | `mipLevel`          | int            | 0          | Mip level in the NTC texture set that the specified image will be loaded into.
 | `name`              | string         | derived    | Name of the texture in the NTC texture set. If not provided, the file name without extension is used instead.
 | `semantics`         | object         | empty      | Map of semantic labels (strings) to channel ranges (also strings). For each semantic label (see below for a full list), a set of channels is specified using a substring of `"RGBA"`. This means that channel order must be preserved; `"RG"` and `"GBA"` are valid channel ranges, while `"BGA"` is not.
+| `storageColorSpace` | string         | derived    | Color space that the texture's channels are quantized and stored in: `linear`, `srgb` or `hlg`. See below.
 | `verticalFlip`      | bool           | `false`    | If set to `true`, the texture will be flipped along the Y axis on load.
+
+## Storage color space
+
+`isSRGB` describes how the *source image* is encoded. `storageColorSpace` describes the transfer function that the
+data is quantized in *inside the NTC file*, which is what determines where the compressor spends its precision.
+The two are independent: the encoder converts from one to the other on load and back on decompression, so the
+round trip is correct for any combination.
+
+When `storageColorSpace` is not specified, the default depends on the source image's channel format:
+
+- Floating point images (`.exr`) are stored as `hlg`.
+- All other images are stored in their source color space, i.e. `srgb` when `isSRGB` is set and `linear` otherwise.
+
+Hybrid Log-Gamma is a good default for HDR *color*, where it maps an unbounded range into a compact domain and
+distributes quantization levels perceptually. It is a poor fit for floating point channels that do not carry color,
+such as displacement, height, curvature, world-space positions or signed distance fields. HLG concentrates
+quantization levels around zero without bound and starves values well above 1.0, so for a height field it spends
+its resolution on the arbitrary zero of the bake rather than on the tallest features. Set `storageColorSpace` to
+`linear` for those channels.
+
+`storageColorSpace` is per-texture rather than global because a material can legitimately mix an HDR emissive map
+that wants `hlg` with a displacement bake that wants `linear`. The `--floatStorage` command line option of
+`ntc-cli` sets the same value for all floating point textures that do not specify the field, for manifest-less and
+batch use. Use `ntc-cli --describe` to confirm what a file actually ended up with; it reports the storage color
+space of every channel.
+
+Note that the loss function is evaluated on stored values: a channel stored as `linear` with a range much wider
+than `[0, 1]` will therefore carry more weight in the shared loss than one stored as `hlg`, at the expense of the
+other channels in the texture set. Set `lossFunctionScale` appropriately to compensate for this.
 
 ## Semantic labels
 

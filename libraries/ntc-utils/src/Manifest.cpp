@@ -310,6 +310,24 @@ std::optional<ntc::BlockCompressedFormat> ParseBlockCompressedFormat(char const*
     return std::optional<ntc::BlockCompressedFormat>();
 }
 
+std::optional<ntc::ColorSpace> ParseColorSpace(char const* colorSpace)
+{
+    if (!colorSpace || !colorSpace[0])
+        return std::optional<ntc::ColorSpace>();
+
+    std::string uppercaseColorSpace = colorSpace;
+    UppercaseString(uppercaseColorSpace);
+
+    if (uppercaseColorSpace == "LINEAR")
+        return ntc::ColorSpace::Linear;
+    if (uppercaseColorSpace == "SRGB")
+        return ntc::ColorSpace::sRGB;
+    if (uppercaseColorSpace == "HLG")
+        return ntc::ColorSpace::HLG;
+
+    return std::optional<ntc::ColorSpace>();
+}
+
 bool ManifestSemanticNameEqualsInsensitive(std::string const& nameUtf8, char const* asciiLiteral)
 {
     if (!asciiLiteral)
@@ -763,6 +781,21 @@ static bool ParseManifest(char const* jsonData, size_t jsonSize, char const* man
             }
         }
 
+        // Parse the storage color space override
+        std::string const storageColorSpace = node["storageColorSpace"].asString();
+        if (!storageColorSpace.empty())
+        {
+            entry.storageColorSpace = ParseColorSpace(storageColorSpace.c_str());
+            if (!entry.storageColorSpace.has_value())
+            {
+                std::ostringstream oss;
+                oss << "Unknown storage color space '" << storageColorSpace << "' specified for texture '"
+                    << entry.entryName << "'. Must be one of: linear, srgb, hlg.";
+                outError = oss.str();
+                return false;
+            }
+        }
+
         // Parse per-texture semantic bindings from manifest (skipped when ignoreInlineSemantics is set)
         if (!ignoreInlineSemantics)
         {
@@ -945,6 +978,11 @@ bool WriteManifestToFile(char const* fileName, Manifest const& manifest, std::st
                 node["bcFormat"] = ntc::BlockCompressedFormatToString(entry.bcFormat);
                 break;
         }
+
+        // Storage color space is only written when it was requested explicitly, so that omitting it keeps
+        // the format-derived default.
+        if (entry.storageColorSpace.has_value())
+            node["storageColorSpace"] = ntc::ColorSpaceToString(entry.storageColorSpace.value());
 
         // Semantics: channel bindings only; sRGB is expressed only as top-level "isSRGB" (not duplicated here).
         if (!entry.semantics.empty())

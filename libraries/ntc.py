@@ -105,6 +105,7 @@ class Arguments:
     dimensions: str = ''
     discardMaskedOutPixels: bool = False
     experimentalKnob: Optional[float] = None
+    floatStorage: str = ''
     generateMips: bool = False
     gdeflate: str = ''
     gdeflateLevel: Optional[int] = None
@@ -187,6 +188,7 @@ class CompressionRun:
 
 @dataclass
 class Result:
+    stdout: str = '' # raw ntc-cli output, for fields that are not parsed into this structure
     elapsedTime: float = 0 # total ntc-cli execution time in seconds
     overallPsnr: Optional[float] = None
     overallPsnrFP8: Optional[float] = None
@@ -270,6 +272,7 @@ def run(args: Arguments) -> Result:
         raise RuntimeError(command, output.returncode, output.stdout, output.stderr)
     
     result = Result(
+        stdout=output.stdout,
         elapsedTime=taskEndTime - taskStartTime,
         bitsPerPixel=args.bitsPerPixel # if the tool doesn't give us selected BPP, inherit it from the arguments
     )

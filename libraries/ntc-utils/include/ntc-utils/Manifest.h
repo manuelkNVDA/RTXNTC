@@ -41,6 +41,9 @@ struct ManifestEntry
     bool isSRGB = false;
     bool verticalFlip = false;
     ntc::BlockCompressedFormat bcFormat = ntc::BlockCompressedFormat::None;
+    /** Color space the channels are quantized and stored in (manifest \c "storageColorSpace"). When empty, FLOAT32
+     *  inputs are stored as HLG and other formats are stored in their source color space. */
+    std::optional<ntc::ColorSpace> storageColorSpace;
     std::vector<float> lossFunctionScales;
 };
 
@@ -74,6 +77,9 @@ void UppercaseString(std::string& s);
 void ClampChannelSwizzleToSourceChannelCount(std::string& channelSwizzle, int sourceImageChannelCount);
 
 std::optional<ntc::BlockCompressedFormat> ParseBlockCompressedFormat(char const* format, bool enableAuto = false);
+
+/** Parse a color space keyword: \c linear, \c srgb or \c hlg, case-insensitive. */
+std::optional<ntc::ColorSpace> ParseColorSpace(char const* colorSpace);
 
 /** Case-insensitive match for manifest semantic names (ASCII). */
 bool ManifestSemanticNameEqualsInsensitive(std::string const& nameUtf8, char const* asciiLiteral);

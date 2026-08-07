@@ -47,6 +47,10 @@ bool WriteDdsHeader(ntc::IStream* ddsFile, int width, int height, int mipLevels,
 
 bool SavePNG(uint8_t* data, int mipWidth, int mipHeight, int numChannels, bool is16Bit, char const* fileName);
 
+/** Number of channels actually present in an EXR file, or 0 if it cannot be determined. Loading an EXR always
+ *  produces 4 channels, so this is the only way to tell how many of them carry data. */
+int GetEXRChannelCount(char const* fileName);
+
 void StartAsyncTask(std::function<void()> function);
 
 void WaitForAllTasks();

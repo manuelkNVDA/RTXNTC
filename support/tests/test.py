@@ -12,6 +12,8 @@
 
 import argparse
 import unittest
+import json
+import math
 import os
 import sys
 import shutil
@@ -369,6 +371,125 @@ class HdrCompressionTestCase(TestCase):
         self.assertBetween(psnr, 38, 42)
 
 
+class FloatStorageColorSpaceTestCase(TestCase):
+
+    def __str__(self):
+        return 'Float Storage Color Space'
+
+    def makeDisplacementExr(self, fileName):
+        """A single channel height field of the kind that HLG handles badly: it straddles zero, extends well
+        above 1.0, and carries its finest detail at the top of the range rather than around zero."""
+        size = 256
+        u = numpy.linspace(0, 1, size, dtype=numpy.float32)
+        ramp = numpy.tile(-3 + 13 * u, (size, 1))
+        spikes = numpy.zeros((size, size), dtype=numpy.float32)
+        spikes[::16, ::16] = 0.25
+        height = ramp + spikes
+
+        header = OpenEXR.Header(size, size)
+        header['channels'] = {'R': Imath.Channel(Imath.PixelType(Imath.PixelType.FLOAT))}
+        exrFile = OpenEXR.OutputFile(fileName, header)
+        exrFile.writePixels({'R': height.tobytes()})
+        exrFile.close()
+
+        return height
+
+    def storageColorSpaces(self, ntcFileName):
+        "Returns the 'Storage color spaces' values reported by --describe for the first texture."
+        args = ntc.Arguments(
+            tool=self.tool,
+            cudaDevice=_CUDA_DEVICE,
+            loadCompressed=ntcFileName,
+            describe=True
+        )
+
+        result = ntc.run(args)
+
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if line.startswith('Storage color spaces:'):
+                values = line[len('Storage color spaces:'):].split('(')[0]
+                return [value.strip() for value in values.split(',')]
+
+        self.fail(f'--describe did not report storage color spaces:\n{result.stdout}')
+
+    def compress(self, sourceFileName, ntcFileName, storageColorSpace, floatStorage):
+        "Compresses a single channel EXR, optionally pinning the storage color space in the manifest."
+        entry = {'fileName': sourceFileName.replace('\\', '/'), 'name': 'Displacement', 'channelSwizzle': 'R'}
+        if storageColorSpace is not None:
+            entry['storageColorSpace'] = storageColorSpace
+
+        args = ntc.Arguments(
+            tool=self.tool,
+            cudaDevice=_CUDA_DEVICE,
+            readManifestFromStdin=True,
+            stdin=json.dumps({'textures': [entry]}),
+            compress=True,
+            bitsPerPixel=8.0,
+            trainingSteps=2000,
+            stepsPerIteration=1000,
+            randomSeed=1337,
+            stableTraining=True,
+            saveCompressed=ntcFileName,
+            floatStorage=floatStorage
+        )
+
+        return ntc.run(args)
+
+    def decompress(self, ntcFileName, outputDir):
+        args = ntc.Arguments(
+            tool=self.tool,
+            cudaDevice=_CUDA_DEVICE,
+            loadCompressed=ntcFileName,
+            decompress=True,
+            saveImages=outputDir,
+            imageFormat='exr',
+            bcFormat='none'
+        )
+
+        ntc.run(args)
+        return _loadExrImage(os.path.join(outputDir, 'Displacement.exr'))[:, :, 0]
+
+    @unittest.skipIf(not _OPEN_EXR_SUPPORTED, 'Requires OpenEXR')
+    def runTest(self):
+        sourceFileName = os.path.join(scratchDir, 'Displacement.exr')
+        source = self.makeDisplacementExr(sourceFileName)
+
+        # Floating point inputs are stored as HLG unless something says otherwise. Existing files and pipelines
+        # depend on that, so it must not change silently.
+        defaultNtc = os.path.join(scratchDir, 'default.ntc')
+        self.compress(sourceFileName, defaultNtc, storageColorSpace=None, floatStorage='')
+        self.assertEqual(self.storageColorSpaces(defaultNtc), ['HLG'])
+
+        # --floatStorage overrides that default.
+        linearNtc = os.path.join(scratchDir, 'linear.ntc')
+        self.compress(sourceFileName, linearNtc, storageColorSpace=None, floatStorage='linear')
+        self.assertEqual(self.storageColorSpaces(linearNtc), ['Linear'])
+
+        # The manifest field wins over the command line.
+        manifestNtc = os.path.join(scratchDir, 'manifest.ntc')
+        self.compress(sourceFileName, manifestNtc, storageColorSpace='hlg', floatStorage='linear')
+        self.assertEqual(self.storageColorSpaces(manifestNtc), ['HLG'])
+
+        # Linear storage must reconstruct the full range of the source, which here is [-3, 10]. This is the
+        # regression guard: any clamp to [0, 1] in the storage, training or decode path would collapse the ramp.
+        # The bounds are wide because reconstruction is known to overshoot the source range slightly.
+        decoded = self.decompress(linearNtc, os.path.join(scratchDir, 'output_linear'))
+        self.assertEqual(decoded.shape, source.shape)
+        self.assertTrue(numpy.all(numpy.isfinite(decoded)))
+        self.assertBetween(float(decoded.min()), -6, -2)
+        self.assertBetween(float(decoded.max()), 9, 13)
+
+        # Both transfers must round trip to a sensible accuracy in linear units. The threshold is loose on
+        # purpose: this asserts that neither path is broken, not that one of them is better.
+        valueRange = float(source.max() - source.min())
+        for name, ntcFileName in (('hlg', defaultNtc), ('linear', linearNtc)):
+            decoded = self.decompress(ntcFileName, os.path.join(scratchDir, f'output_{name}'))
+            rms = float(numpy.sqrt(numpy.mean((decoded.astype(numpy.float64) - source) ** 2)))
+            psnr = 20 * math.log10(valueRange / rms)
+            self.assertGreater(psnr, 20, f'{name} storage round trip is only {psnr:.1f} dB')
+
+
 class OptixDecompressionTestCase(TestCase):
 
     def __str__(self):
@@ -532,6 +653,7 @@ if __name__ == '__main__':
         suite.addTest(CompressionTestCase())
         suite.addTest(DeterminismTestCase())
         suite.addTest(HdrCompressionTestCase())
+        suite.addTest(FloatStorageColorSpaceTestCase())
 
     for api in ('cuda', 'vk', 'dx12'):
         if api == 'cuda':

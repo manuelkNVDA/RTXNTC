@@ -47,6 +47,7 @@ struct
     ToolInputType inputType = ToolInputType::None;
     std::vector<char const*> loadImagesList;
     std::optional<ntc::BlockCompressedFormat> bcFormat;
+    std::optional<ntc::ColorSpace> floatStorageColorSpace;
     ImageContainer imageFormat = ImageContainer::Auto;
     bool compress = false;
     bool decompress = false;
@@ -94,6 +95,7 @@ bool ProcessCommandLine(int argc, const char** argv)
     const char* imageFormatString = nullptr;
     const char* dimensionsString = nullptr;
     const char* gdeflateString = nullptr;
+    const char* floatStorageString = nullptr;
 
     struct argparse_option options[] = {
         OPT_GROUP("Actions:"),
@@ -121,6 +123,7 @@ bool ProcessCommandLine(int argc, const char** argv)
         OPT_FLOAT  ('b', "bitsPerPixel", &g_options.bitsPerPixel, "Request an optimal compression configuration for the provided BPP value"),
         OPT_FLOAT  (0,   "maxBitsPerPixel", &g_options.maxBitsPerPixel, "Maximum BPP value to use in the compression parameter search"),
         OPT_FLOAT  ('p', "targetPsnr", &g_options.targetPsnr, "Perform compression parameter search to reach at least the provided PSNR value"),
+        OPT_STRING (0,   "floatStorage", &floatStorageString, "Color space to store floating point input channels in: linear, srgb or hlg (default is hlg). The manifest 'storageColorSpace' field overrides this"),
         
         OPT_GROUP("Custom latent shape selection:"),
         OPT_INTEGER(0, "gridSizeScale", &g_options.gridSizeScale, "Ratio of source image size to high-resolution feature grid size"),
@@ -426,6 +429,17 @@ bool ProcessCommandLine(int argc, const char** argv)
         }
     }
 
+    if (floatStorageString)
+    {
+        g_options.floatStorageColorSpace = ParseColorSpace(floatStorageString);
+        if (!g_options.floatStorageColorSpace.has_value())
+        {
+            fprintf(stderr, "Invalid --floatStorage value '%s', must be one of: linear, srgb, hlg.\n",
+                floatStorageString);
+            return false;
+        }
+    }
+
     if (dimensionsString)
     {
         int width = 0, height = 0;
@@ -719,6 +733,33 @@ void OverrideTextureBcFormat(ntc::ITextureMetadata* texture, ManifestEntry* mani
     }
 }
 
+struct StorageColorSpaces
+{
+    ntc::ColorSpace rgb = ntc::ColorSpace::Linear;
+    ntc::ColorSpace alpha = ntc::ColorSpace::Linear;
+};
+
+// Color spaces that a texture's channels are quantized and stored in. An explicit request coming from the manifest
+// or from --floatStorage wins. Without one, floating point inputs default to HLG because it maps an unbounded HDR
+// range into a compact domain; other formats are stored in the color space they were authored in.
+StorageColorSpaces ResolveStorageColorSpaces(std::optional<ntc::ColorSpace> requestedColorSpace,
+    ntc::ChannelFormat channelFormat, ntc::ColorSpace srcRgbColorSpace)
+{
+    ntc::ColorSpace rgb;
+    if (requestedColorSpace.has_value())
+        rgb = requestedColorSpace.value();
+    else if (channelFormat == ntc::ChannelFormat::FLOAT32)
+        rgb = ntc::ColorSpace::HLG;
+    else
+        rgb = srcRgbColorSpace;
+
+    StorageColorSpaces result;
+    result.rgb = rgb;
+    // sRGB is a curve for color, and alpha is not color, so alpha follows the RGB choice except for that case.
+    result.alpha = (rgb == ntc::ColorSpace::sRGB) ? ntc::ColorSpace::Linear : rgb;
+    return result;
+}
+
 ntc::ITextureSet* LoadImages(ntc::IContext* context, Manifest& manifest)
 {
     ntc::TextureSetDesc textureSetDesc{};
@@ -769,6 +810,7 @@ ntc::ITextureSet* LoadImages(ntc::IContext* context, Manifest& manifest)
         std::string name;
         ntc::ChannelFormat channelFormat = ntc::ChannelFormat::UNORM8;
         ntc::BlockCompressedFormat bcFormat = ntc::BlockCompressedFormat::None;
+        std::optional<ntc::ColorSpace> storageColorSpace;
         bool isSRGB = false;
         std::vector<float> lossFunctionScales;
 
@@ -853,6 +895,7 @@ ntc::ITextureSet* LoadImages(ntc::IContext* context, Manifest& manifest)
             image->name = entry.entryName;
             image->isSRGB = entry.isSRGB;
             image->bcFormat = entry.bcFormat;
+            image->storageColorSpace = entry.storageColorSpace;
             image->firstChannel = entry.firstChannel;
             image->manifestIndex = entryIndex;
             image->verticalFlip = entry.verticalFlip;
@@ -886,6 +929,20 @@ ntc::ITextureSet* LoadImages(ntc::IContext* context, Manifest& manifest)
                 image->storedChannels = image->channels;
             else
                 image->storedChannels = image->channelSwizzle.size();
+
+            // An EXR is always loaded as 4 channels no matter what it contains, so without a swizzle a
+            // single-channel file takes up four channels of the texture set holding three copies of itself.
+            if (extension == ".exr" && image->channelSwizzle.empty())
+            {
+                int const fileChannels = GetEXRChannelCount(entry.fileName.c_str());
+                if (fileChannels > 0 && fileChannels < image->channels)
+                {
+                    fprintf(stderr, "Warning: '%s' has %d channel(s) but will occupy %d channels of the texture "
+                        "set. Set \"channelSwizzle\": \"%s\" for it in a manifest to store only its real channels.\n",
+                        fileName.filename().generic_string().c_str(), fileChannels, image->channels,
+                        std::string("RGBA").substr(0, fileChannels).c_str());
+                }
+            }
 
             // Find the alpha mask semantic in the manifest, store the channel index
             for (ImageSemanticBinding const& binding : entry.semantics)
@@ -1201,11 +1258,18 @@ ntc::ITextureSet* LoadImages(ntc::IContext* context, Manifest& manifest)
         size_t const bytesPerComponent = ntc::GetBytesPerPixelComponent(image->channelFormat);
         size_t const pixelStride = 4 * bytesPerComponent;
         ntc::ColorSpace const srcRgbColorSpace = image->isSRGB ? ntc::ColorSpace::sRGB : ntc::ColorSpace::Linear;
-        ntc::ColorSpace const dstRgbColorSpace = image->channelFormat == ntc::ChannelFormat::FLOAT32 ? ntc::ColorSpace::HLG : srcRgbColorSpace;
         ntc::ColorSpace const srcAlphaColorSpace = ntc::ColorSpace::Linear;
-        ntc::ColorSpace const dstAlphaColorSpace = image->channelFormat == ntc::ChannelFormat::FLOAT32 ? ntc::ColorSpace::HLG : srcAlphaColorSpace;
+
+        // --floatStorage only applies to the floating point inputs that would otherwise be forced to HLG.
+        std::optional<ntc::ColorSpace> requestedColorSpace = image->storageColorSpace;
+        if (!requestedColorSpace.has_value() && image->channelFormat == ntc::ChannelFormat::FLOAT32)
+            requestedColorSpace = g_options.floatStorageColorSpace;
+
+        StorageColorSpaces const storage = ResolveStorageColorSpaces(requestedColorSpace, image->channelFormat,
+            srcRgbColorSpace);
+
         ntc::ColorSpace const srcColorSpaces[4] = { srcRgbColorSpace, srcRgbColorSpace, srcRgbColorSpace, srcAlphaColorSpace };
-        ntc::ColorSpace const dstColorSpaces[4] = { dstRgbColorSpace, dstRgbColorSpace, dstRgbColorSpace, dstAlphaColorSpace };
+        ntc::ColorSpace const dstColorSpaces[4] = { storage.rgb, storage.rgb, storage.rgb, storage.alpha };
 
         for (int mip = 0; mip < textureSetDesc.mips; ++mip)
         {
@@ -1723,27 +1787,24 @@ void DescribeTextureSet(ntc::ITextureSetMetadata* textureSet)
         if (numChannels > 3)
             printf("   Alpha color space: %s\n", ntc::ColorSpaceToString(texture->GetAlphaColorSpace()));
 
+        // The color spaces above describe the source images; the channels may be quantized and stored in a
+        // different one, so report that unconditionally and flag the disagreement.
+        printf("   Storage color spaces: ");
         bool colorSpacesMatch = true;
         for (int ch = 0; ch < numChannels; ++ch)
         {
-            ntc::ColorSpace const dstColorSpace = (ch < 3) ? texture->GetRgbColorSpace() : texture->GetAlphaColorSpace();
-            if (textureSet->GetChannelStorageColorSpace(firstChannel + ch) != dstColorSpace)
-            {
-                colorSpacesMatch = false;
-                break;
-            }
-        }
+            ntc::ColorSpace const storageColorSpace = textureSet->GetChannelStorageColorSpace(firstChannel + ch);
+            ntc::ColorSpace const sourceColorSpace = (ch < 3)
+                ? texture->GetRgbColorSpace()
+                : texture->GetAlphaColorSpace();
+            colorSpacesMatch = colorSpacesMatch && storageColorSpace == sourceColorSpace;
 
-        if (!colorSpacesMatch)
-        {
-            printf("   Storage color spaces: ");
-            for (int ch = 0; ch < numChannels; ++ch)
-            {
-                if (ch > 0) printf(", ");
-                printf("%s", ntc::ColorSpaceToString(textureSet->GetChannelStorageColorSpace(firstChannel + ch)));
-            }
-            printf("\n");
+            if (ch > 0) printf(", ");
+            printf("%s", ntc::ColorSpaceToString(storageColorSpace));
         }
+        if (!colorSpacesMatch)
+            printf(" (differs from the source color space)");
+        printf("\n");
 
         if (texture->GetBlockCompressedFormat() == ntc::BlockCompressedFormat::BC7)
         {

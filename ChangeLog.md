@@ -10,6 +10,15 @@
 ### Command-Line Tool
 
 - Added a mode to decompress texture sets with OptiX for testing.
+- Added `storageColorSpace` to JSON manifest `--floatStorage` command line option
+  * selects the color space that a texture's channels are stored in (usefull for displacements or height fields)
+- Changed `--describe` : systematically reports the storage color space of each channel now
+- Bug fix: saving 2-channel textures as EXR works now
+- Bug fix: saving 1-channel textures as EXR now correctly name the channel `R` instead of `A`.
+
+### Testing Infrastructure
+
+- Added a round-trip test for float channels stored in different color spaces.
 
 
 ## 0.9.2 BETA

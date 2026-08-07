@@ -213,6 +213,74 @@ char const* GetContainerExtension(ImageContainer container)
     }
 }
 
+int GetEXRChannelCount(char const* fileName)
+{
+    EXRVersion version;
+    if (ParseEXRVersionFromFile(&version, fileName) != TINYEXR_SUCCESS)
+        return 0;
+
+    EXRHeader header;
+    InitEXRHeader(&header);
+    if (ParseEXRHeaderFromFile(&header, &version, fileName, nullptr) != TINYEXR_SUCCESS)
+        return 0;
+
+    int const channelCount = header.num_channels;
+    FreeEXRHeader(&header);
+    return channelCount;
+}
+
+// tinyexr's SaveEXR() helper rejects 2-channel images and names a lone channel 'A', so go through the lower level
+// API instead. Channels are written as half, planar, and in the alphabetical order that the EXR format requires.
+static bool SaveEXRImage(float const* data, int width, int height, int channels, char const* fileName)
+{
+    if (channels < 1 || channels > 4)
+        return false;
+
+    static char const* const channelNames[4] = { "R", "G", "B", "A" };
+    size_t const pixelCount = size_t(width) * size_t(height);
+
+    std::vector<std::vector<float>> planes(channels);
+    std::vector<unsigned char*> planePointers(channels);
+    std::vector<EXRChannelInfo> channelInfos(channels);
+    std::vector<int> pixelTypes(channels, TINYEXR_PIXELTYPE_FLOAT);
+    std::vector<int> requestedPixelTypes(channels, TINYEXR_PIXELTYPE_HALF);
+
+    for (int channel = 0; channel < channels; ++channel)
+    {
+        // Alphabetical order for an RGBA prefix means reversed.
+        int const srcChannel = channels - 1 - channel;
+
+        std::vector<float>& plane = planes[channel];
+        plane.resize(pixelCount);
+        for (size_t pixel = 0; pixel < pixelCount; ++pixel)
+            plane[pixel] = data[pixel * size_t(channels) + size_t(srcChannel)];
+        planePointers[channel] = reinterpret_cast<unsigned char*>(plane.data());
+
+        channelInfos[channel] = EXRChannelInfo{};
+        snprintf(channelInfos[channel].name, sizeof(channelInfos[channel].name), "%s", channelNames[srcChannel]);
+    }
+
+    EXRHeader header;
+    InitEXRHeader(&header);
+    header.num_channels = channels;
+    header.channels = channelInfos.data();
+    header.pixel_types = pixelTypes.data();
+    header.requested_pixel_types = requestedPixelTypes.data();
+    header.compression_type = (width < 16 && height < 16)
+        ? TINYEXR_COMPRESSIONTYPE_NONE
+        : TINYEXR_COMPRESSIONTYPE_ZIP;
+
+    EXRImage image;
+    InitEXRImage(&image);
+    image.num_channels = channels;
+    image.images = planePointers.data();
+    image.width = width;
+    image.height = height;
+
+    // The header does not own any of the arrays above, so it must not be freed with FreeEXRHeader.
+    return SaveEXRImageToFile(&image, &header, fileName, nullptr) == TINYEXR_SUCCESS;
+}
+
 bool SaveImageToContainer(ImageContainer container, void const* data, int width, int height, int channels, char const* fileName)
 {
     switch(container)
@@ -231,7 +299,6 @@ bool SaveImageToContainer(ImageContainer container, void const* data, int width,
     case ImageContainer::TGA:
         return !!stbi_write_tga(fileName, width, height, channels, data);
     case ImageContainer::EXR:
-        return SaveEXR((float const*)data, width, height, channels, /* save_as_fp16 = */ true,
-            fileName, /* err = */ nullptr) == TINYEXR_SUCCESS;
+        return SaveEXRImage((float const*)data, width, height, channels, fileName);
     }
 }
